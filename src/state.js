@@ -110,6 +110,8 @@ let pendingTimer = null;
 let autoReturnTimer = null;
 let pendingState = null;
 let eyeResendTimer = null;
+let pendingNotifyContext = null;
+let pendingNotifyContextForQueued = null;
 
 // ── Wake poll ──
 let wakePollTimer = null;
@@ -141,6 +143,7 @@ function setState(newState, svgOverride) {
     clearTimeout(pendingTimer);
     pendingTimer = null;
     pendingState = null;
+    pendingNotifyContextForQueued = null;
   }
 
   const sameState = newState === currentState;
@@ -156,12 +159,16 @@ function setState(newState, svgOverride) {
   if (remaining > 0) {
     if (autoReturnTimer) { clearTimeout(autoReturnTimer); autoReturnTimer = null; }
     pendingState = newState;
+    pendingNotifyContextForQueued = pendingNotifyContext ? { ...pendingNotifyContext } : null;
     const pendingSvgOverride = svgOverride;
     pendingTimer = setTimeout(() => {
       pendingTimer = null;
       const queued = pendingState;
       const queuedSvg = pendingSvgOverride;
+      const queuedNotifyContext = pendingNotifyContextForQueued;
       pendingState = null;
+      pendingNotifyContextForQueued = null;
+      if (queuedNotifyContext) pendingNotifyContext = queuedNotifyContext;
       if (ONESHOT_STATES.has(queued)) {
         applyState(queued, queuedSvg);
       } else {
@@ -196,6 +203,22 @@ function applyState(state, svgOverride) {
   const svgs = STATE_SVGS[state] || STATE_SVGS.idle;
   const svg = svgOverride || svgs[Math.floor(Math.random() * svgs.length)];
   currentSvg = svg;
+
+  if (typeof ctx.notifyDisplayState === "function") {
+    let notifySession = pendingNotifyContext;
+    if (!notifySession) {
+      let latestAt = -1;
+      for (const [id, s] of sessions) {
+        if (s.headless) continue;
+        if (s.updatedAt >= latestAt) {
+          latestAt = s.updatedAt;
+          notifySession = { id, agentId: s.agentId || null, cwd: s.cwd || "", host: s.host || null };
+        }
+      }
+    }
+    ctx.notifyDisplayState(state, svg, notifySession);
+    pendingNotifyContext = null;
+  }
 
   // Force eye resend after SVG load completes (~300ms)
   // After sweeping → idle, pause eye tracking briefly so eyes stay centered before resuming
@@ -342,6 +365,7 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
     (srcAgentPid ? isProcessAlive(srcAgentPid) : (srcPid ? isProcessAlive(srcPid) : false));
 
   const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, pidReachable };
+  pendingNotifyContext = { id: sessionId, agentId: srcAgentId || null, cwd: srcCwd || "", host: srcHost || null };
 
   if (event === "SessionEnd") {
     const endingSession = sessions.get(sessionId);

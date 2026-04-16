@@ -85,6 +85,7 @@ const i18n = {
     download: "Download",
     bubbleFollow: "Bubble Follow Pet",
     hideBubbles: "Hide Bubbles",
+    realtimeNotifications: "Realtime Notifications",
     showSessionId: "Show Session ID",
     sessions: "Sessions",
     noSessions: "No active sessions",
@@ -133,6 +134,7 @@ const i18n = {
     download: "下载",
     bubbleFollow: "气泡跟随宠物",
     hideBubbles: "隐藏气泡",
+    realtimeNotifications: "实时通知",
     showSessionId: "显示会话编号",
     sessions: "会话",
     noSessions: "无活跃会话",
@@ -252,6 +254,17 @@ module.exports = function initMenu(ctx) {
         checked: ctx.showSessionId,
         click: (menuItem) => {
           ctx.showSessionId = menuItem.checked;
+          buildContextMenu();
+          buildTrayMenu();
+          ctx.savePrefs();
+        },
+      },
+      {
+        label: t("realtimeNotifications"),
+        type: "checkbox",
+        checked: ctx.mobileNotificationsEnabled,
+        click: (menuItem) => {
+          ctx.mobileNotificationsEnabled = menuItem.checked;
           buildContextMenu();
           buildTrayMenu();
           ctx.savePrefs();
@@ -445,6 +458,17 @@ module.exports = function initMenu(ctx) {
         checked: ctx.hideBubbles,
         click: (menuItem) => {
           ctx.hideBubbles = menuItem.checked;
+          buildContextMenu();
+          buildTrayMenu();
+          ctx.savePrefs();
+        },
+      },
+      {
+        label: t("realtimeNotifications"),
+        type: "checkbox",
+        checked: ctx.mobileNotificationsEnabled,
+        click: (menuItem) => {
+          ctx.mobileNotificationsEnabled = menuItem.checked;
           buildContextMenu();
           buildTrayMenu();
           ctx.savePrefs();

@@ -160,24 +160,36 @@ if (event === "SessionStart" && !process.env.CLAWD_REMOTE) getStablePid();
 // Read stdin for session_id (Claude Code pipes JSON with session metadata)
 const chunks = [];
 let sent = false;
+let stdinTimer = null;
 
-process.stdin.on("data", (c) => chunks.push(c));
-process.stdin.on("end", () => {
+function finishWithPayload(payload) {
+  if (stdinTimer) clearTimeout(stdinTimer);
   let sessionId = "default";
   let cwd = "";
   let source = "";
-  try {
-    const payload = JSON.parse(Buffer.concat(chunks).toString());
-    sessionId = payload.session_id || "default";
+  if (payload && typeof payload === "object") {
+    sessionId = payload.session_id || payload.sessionId || "default";
     cwd = payload.cwd || "";
     source = payload.source || payload.reason || "";
-  } catch {}
+  }
   send(sessionId, cwd, source);
+}
+
+process.stdin.on("data", (c) => chunks.push(c));
+process.stdin.on("end", () => {
+  let payload = {};
+  try {
+    const raw = Buffer.concat(chunks).toString();
+    if (raw.trim()) payload = JSON.parse(raw);
+  } catch {
+    payload = {};
+  }
+  finishWithPayload(payload);
 });
 
 // Safety: if stdin doesn't end in 400ms, send with default session
 // (200ms was too aggressive on slow machines / AV scanning)
-setTimeout(() => send("default", ""), 400);
+stdinTimer = setTimeout(() => finishWithPayload({}), 400);
 
 function send(sessionId, cwd, source) {
   if (sent) return;

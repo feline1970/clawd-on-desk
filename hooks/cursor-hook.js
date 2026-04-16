@@ -139,7 +139,10 @@ function resolveStateAndEvent(payload, hookName) {
 
 function runWithPayload(payload) {
   const argvOverride = process.argv[2];
-  const hookNameResolved = argvOverride || (payload && payload.hook_event_name) || "";
+  const hookNameResolved =
+    argvOverride ||
+    (payload && (payload.hook_event_name || payload.hookEventName)) ||
+    "";
   const mapped = resolveStateAndEvent(payload, hookNameResolved);
   if (!mapped) {
     process.stdout.write(stdoutForCursorHook(hookNameResolved) + "\n");
@@ -151,11 +154,19 @@ function runWithPayload(payload) {
   if (hookNameResolved === "sessionStart" && !process.env.CLAWD_REMOTE) getStablePid();
 
   const sessionId =
-    (payload && (payload.conversation_id || payload.session_id)) || "default";
-  let cwd = (payload && payload.cwd) || "";
-  if (!cwd && payload && Array.isArray(payload.workspace_roots) && payload.workspace_roots[0]) {
-    cwd = payload.workspace_roots[0];
-  }
+    (payload && (
+      payload.conversation_id ||
+      payload.conversationId ||
+      payload.session_id ||
+      payload.sessionId
+    )) || "default";
+  let cwd = (payload && (
+    payload.cwd ||
+    payload.workspace_root ||
+    payload.workspaceRoot
+  )) || "";
+  if (!cwd && payload && Array.isArray(payload.workspace_roots) && payload.workspace_roots[0]) cwd = payload.workspace_roots[0];
+  if (!cwd && payload && Array.isArray(payload.workspaceRoots) && payload.workspaceRoots[0]) cwd = payload.workspaceRoots[0];
 
   const body = { state, session_id: sessionId, event };
   body.agent_id = "cursor-agent";

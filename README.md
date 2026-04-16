@@ -41,6 +41,7 @@ A desktop pet that reacts to your AI coding agent sessions in real-time. Clawd l
 - **Terminal focus** — right-click Clawd → Sessions menu to jump to a specific session's terminal window; notification/attention states auto-focus the relevant terminal
 - **Process liveness detection** — detects crashed/exited agent processes (Claude Code, Codex, Copilot) and cleans up orphan sessions
 - **Startup recovery** — if Clawd restarts while any agent is running, it stays awake instead of falling asleep
+- **Mobile terminal-result notification** — Cursor/Codex success or failure can be pushed to Pushover/Telegram, with 5s dedupe to avoid spam
 
 ### System
 - **Click-through** — transparent areas pass clicks to windows below; only Clawd's body is interactive
@@ -102,6 +103,38 @@ npm install
 # Start Clawd (auto-registers Claude Code hooks on launch)
 npm start
 ```
+
+### Mobile Notification (Cursor Agent + Codex CLI)
+
+Terminal-result mobile notifications support **Cursor Agent** and **Codex CLI** (Pushover or Telegram):
+- Cursor success: `event=Stop` or `event=SessionEnd` with `state=sleeping`
+- Cursor failure: `event=StopFailure` or `state=error`
+- Codex success: `event=event_msg:task_complete` with `state=attention`
+- Codex failure: `state=error`
+
+Set environment variables before starting Clawd (you can copy `.env.example` to `.env`; `launch.js` auto-loads `.env`):
+
+```bash
+# enable mobile notification
+PUSHOVER_ENABLED=true
+# app token from Pushover application settings
+PUSHOVER_APP_TOKEN=your_app_token
+# user key from your Pushover account
+PUSHOVER_USER_KEY=your_user_key
+
+# enable Telegram mobile notification
+TELEGRAM_ENABLED=false
+# bot token from @BotFather
+TELEGRAM_BOT_TOKEN=your_bot_token
+# chat id for your target chat
+TELEGRAM_CHAT_ID=your_chat_id
+```
+
+Validation checklist:
+- complete a Cursor task successfully -> phone/watch receives "success"
+- trigger a failing Cursor task -> phone/watch receives "failure"
+- complete a Codex task -> phone/watch receives "success"
+- repeat the same terminal event quickly -> dedupe prevents notification spam
 
 ### Agent Setup
 

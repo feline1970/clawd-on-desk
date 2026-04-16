@@ -1,6 +1,7 @@
 const { app, BrowserWindow, screen, Menu, ipcMain, globalShortcut } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const { createPushoverNotifier } = require("./notifier");
 
 const isMac = process.platform === "darwin";
 const isLinux = process.platform === "linux";
@@ -58,12 +59,39 @@ function savePrefs() {
     x, y, size: currentSize,
     miniMode: _mini.getMiniMode(), miniEdge: _mini.getMiniEdge(), preMiniX: _mini.getPreMiniX(), preMiniY: _mini.getPreMiniY(), lang,
     showTray, showDock,
-    autoStartWithClaude, bubbleFollowPet, hideBubbles, showSessionId,
+    autoStartWithClaude, bubbleFollowPet, hideBubbles, showSessionId, mobileNotificationsEnabled,
   };
   try { fs.writeFileSync(PREFS_PATH, JSON.stringify(data)); } catch {}
 }
 
 let _codexMonitor = null;          // Codex CLI JSONL log polling instance
+const mobileNotifier = createPushoverNotifier();
+
+function reportMobileNotifyResult(channel, result) {
+  if (!result || result.sent || !result.skipped) return;
+  if (result.skipped === "missing-config" || result.skipped === "http-error" || result.skipped === "network-error") {
+    console.warn(`Clawd: ${channel} notification skipped:`, result.skipped);
+  }
+}
+
+function notifyDisplayState(state, _svg, winningSession) {
+  if (!mobileNotificationsEnabled) return;
+  const payload = {
+    agentId: "display-state",
+    event: "DisplayStateChange",
+    state,
+    sessionId: (winningSession && winningSession.id) || "display-global",
+    sourceAgent: (winningSession && winningSession.agentId) || "",
+    projectName: (winningSession && winningSession.cwd) ? path.basename(winningSession.cwd) : "",
+    occurredAt: Date.now(),
+  };
+  mobileNotifier.sendCursorTerminalNotification(payload)
+    .then((result) => reportMobileNotifyResult("pushover", result))
+    .catch(() => {});
+  mobileNotifier.sendCursorTerminalTelegramNotification(payload)
+    .then((result) => reportMobileNotifyResult("telegram", result))
+    .catch(() => {});
+}
 
 // ── CSS <object> sizing (mirrors styles.css #clawd) ──
 const OBJ_SCALE_W = 1.9;   // width: 190%
@@ -94,6 +122,7 @@ let autoStartWithClaude = false;
 let bubbleFollowPet = false;
 let hideBubbles = false;
 let showSessionId = false;
+let mobileNotificationsEnabled = true;
 let petHidden = false;
 const DEFAULT_TOGGLE_SHORTCUT = "CommandOrControl+Shift+Alt+C";
 
@@ -251,6 +280,7 @@ const _stateCtx = {
   miniPeekOut: () => miniPeekOut(),
   buildContextMenu: () => buildContextMenu(),
   buildTrayMenu: () => buildTrayMenu(),
+  notifyDisplayState: (state, svg, winningSession) => notifyDisplayState(state, svg, winningSession),
 };
 const _state = require("./state")(_stateCtx);
 const { setState, applyState, updateSession, resolveDisplayState, getSvgOverride,
@@ -421,6 +451,8 @@ const _menuCtx = {
   set hideBubbles(v) { hideBubbles = v; },
   get showSessionId() { return showSessionId; },
   set showSessionId(v) { showSessionId = v; },
+  get mobileNotificationsEnabled() { return mobileNotificationsEnabled; },
+  set mobileNotificationsEnabled(v) { mobileNotificationsEnabled = v; },
   get pendingPermissions() { return pendingPermissions; },
   repositionBubbles: () => repositionBubbles(),
   get petHidden() { return petHidden; },
@@ -479,6 +511,7 @@ function createWindow() {
   if (prefs && typeof prefs.bubbleFollowPet === "boolean") bubbleFollowPet = prefs.bubbleFollowPet;
   if (prefs && typeof prefs.hideBubbles === "boolean") hideBubbles = prefs.hideBubbles;
   if (prefs && typeof prefs.showSessionId === "boolean") showSessionId = prefs.showSessionId;
+  if (prefs && typeof prefs.mobileNotificationsEnabled === "boolean") mobileNotificationsEnabled = prefs.mobileNotificationsEnabled;
   // macOS: apply dock visibility (default hidden)
   if (isMac) {
     applyDockVisibility();
