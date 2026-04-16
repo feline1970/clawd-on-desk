@@ -2,6 +2,7 @@ const { app, BrowserWindow, screen, Menu, ipcMain, globalShortcut, nativeTheme, 
 const path = require("path");
 const fs = require("fs");
 const { pathToFileURL } = require("url");
+const { createPushoverNotifier } = require("./notifier");
 const { applyStationaryCollectionBehavior } = require("./mac-window");
 const hitGeometry = require("./hit-geometry");
 const animationCycle = require("./animation-cycle");
@@ -195,6 +196,32 @@ function flushRuntimeStateToPrefs() {
 
 let _codexMonitor = null;          // Codex CLI JSONL log polling instance
 let _geminiMonitor = null;         // Gemini CLI session JSON polling instance
+const mobileNotifier = createPushoverNotifier();
+
+function reportMobileNotifyResult(channel, result) {
+  if (!result || result.sent || !result.skipped) return;
+  if (result.skipped === "missing-config" || result.skipped === "http-error" || result.skipped === "network-error") {
+    console.warn(`Clawd: ${channel} notification skipped:`, result.skipped);
+  }
+}
+
+function notifySessionEvent(payload) {
+  if (!mobileNotificationsEnabled) return;
+  const body = {
+    agentId: payload && payload.agentId,
+    event: payload && payload.event,
+    state: payload && payload.state,
+    sessionId: payload && payload.sessionId,
+    projectName: payload && payload.cwd ? path.basename(payload.cwd) : "",
+    occurredAt: Date.now(),
+  };
+  mobileNotifier.sendCursorTerminalNotification(body)
+    .then((result) => reportMobileNotifyResult("pushover", result))
+    .catch(() => {});
+  mobileNotifier.sendCursorTerminalTelegramNotification(body)
+    .then((result) => reportMobileNotifyResult("telegram", result))
+    .catch(() => {});
+}
 
 // Hook-based agents have no module-level monitor — they're gated at the
 // HTTP route layer. Only log-poll agents hit these branches.
@@ -300,6 +327,7 @@ let openAtLogin = _settingsController.get("openAtLogin");
 let bubbleFollowPet = _settingsController.get("bubbleFollowPet");
 let hideBubbles = _settingsController.get("hideBubbles");
 let showSessionId = _settingsController.get("showSessionId");
+let mobileNotificationsEnabled = _settingsController.get("mobileNotificationsEnabled");
 let soundMuted = _settingsController.get("soundMuted");
 let petHidden = false;
 const DEFAULT_TOGGLE_SHORTCUT = "CommandOrControl+Shift+Alt+C";
@@ -572,6 +600,7 @@ const _stateCtx = {
   get mouseStillSince() { return _tick ? _tick._mouseStillSince : Date.now(); },
   get pendingPermissions() { return pendingPermissions; },
   get showSessionId() { return showSessionId; },
+  notifySessionEvent,
   sendToRenderer,
   sendToHitWin,
   syncHitWin,
@@ -810,6 +839,8 @@ const _menuCtx = {
   set hideBubbles(v) { _settingsController.applyUpdate("hideBubbles", v); },
   get showSessionId() { return showSessionId; },
   set showSessionId(v) { _settingsController.applyUpdate("showSessionId", v); },
+  get mobileNotificationsEnabled() { return mobileNotificationsEnabled; },
+  set mobileNotificationsEnabled(v) { _settingsController.applyUpdate("mobileNotificationsEnabled", v); },
   get soundMuted() { return soundMuted; },
   set soundMuted(v) { _settingsController.applyUpdate("soundMuted", v); },
   get pendingPermissions() { return pendingPermissions; },
@@ -869,7 +900,7 @@ const { t, buildContextMenu, buildTrayMenu, rebuildAllMenus, createTray,
 // route writes through the controller, so menu clicks and IPC updates
 // from a future settings panel land here identically.
 const MENU_AFFECTING_KEYS = new Set([
-  "lang", "soundMuted", "bubbleFollowPet", "hideBubbles", "showSessionId",
+  "lang", "soundMuted", "bubbleFollowPet", "hideBubbles", "showSessionId", "mobileNotificationsEnabled",
   "manageClaudeHooksAutomatically", "autoStartWithClaude", "openAtLogin", "showTray", "showDock", "theme", "size",
 ]);
 function wireSettingsSubscribers() {
@@ -906,6 +937,7 @@ function wireSettingsSubscribers() {
     if ("bubbleFollowPet" in changes) bubbleFollowPet = changes.bubbleFollowPet;
     if ("hideBubbles" in changes) hideBubbles = changes.hideBubbles;
     if ("showSessionId" in changes) showSessionId = changes.showSessionId;
+    if ("mobileNotificationsEnabled" in changes) mobileNotificationsEnabled = changes.mobileNotificationsEnabled;
     if ("soundMuted" in changes) soundMuted = changes.soundMuted;
 
     // 2. Reactive side effects (mirror what the legacy setters / click handlers used to do).

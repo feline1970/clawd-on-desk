@@ -133,6 +133,12 @@ module.exports = function initMenu(ctx) {
         checked: ctx.showSessionId,
         click: (menuItem) => { ctx.showSessionId = menuItem.checked; },
       },
+      {
+        label: t("realtimeNotifications"),
+        type: "checkbox",
+        checked: ctx.mobileNotificationsEnabled,
+        click: (menuItem) => { ctx.mobileNotificationsEnabled = menuItem.checked; },
+      },
       { type: "separator" },
       {
         label: t("theme"),
@@ -433,6 +439,12 @@ module.exports = function initMenu(ctx) {
       {
         label: `${t("sessions")} (${ctx.sessions.size})`,
         submenu: ctx.buildSessionSubmenu(),
+      },
+      {
+        label: t("realtimeNotifications"),
+        type: "checkbox",
+        checked: ctx.mobileNotificationsEnabled,
+        click: (menuItem) => { ctx.mobileNotificationsEnabled = menuItem.checked; },
       },
       { type: "separator" },
       {

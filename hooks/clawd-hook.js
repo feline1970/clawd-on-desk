@@ -41,7 +41,7 @@ const resolve = createPidResolver({
 if (event === "SessionStart" && !process.env.CLAWD_REMOTE) resolve();
 
 readStdinJson().then((payload) => {
-  const sessionId = payload.session_id || "default";
+  const sessionId = payload.session_id || payload.sessionId || "default";
   const cwd = payload.cwd || "";
   const source = payload.source || payload.reason || "";
 

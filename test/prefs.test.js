@@ -43,6 +43,7 @@ describe("prefs.getDefaults", () => {
     const d = prefs.getDefaults();
     assert.strictEqual(d.manageClaudeHooksAutomatically, true);
     assert.strictEqual(d.autoStartWithClaude, false);
+    assert.strictEqual(d.mobileNotificationsEnabled, true);
   });
 
   it("seeds all known agents as enabled", () => {
@@ -72,6 +73,7 @@ describe("prefs.validate", () => {
       x: NaN,                // not finite
       bubbleFollowPet: true, // ok
       hideBubbles: 0,        // wrong type
+      mobileNotificationsEnabled: "on", // wrong type
     });
     const d = prefs.getDefaults();
     assert.strictEqual(v.lang, d.lang);
@@ -79,6 +81,7 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.x, 0);
     assert.strictEqual(v.bubbleFollowPet, true);
     assert.strictEqual(v.hideBubbles, false);
+    assert.strictEqual(v.mobileNotificationsEnabled, true);
   });
 
   it("keeps valid fields verbatim", () => {
@@ -86,6 +89,7 @@ describe("prefs.validate", () => {
       lang: "ko",
       soundMuted: true,
       bubbleFollowPet: true,
+      mobileNotificationsEnabled: false,
       x: 100,
       y: -50,
       size: "P:15",
@@ -95,6 +99,7 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.lang, "ko");
     assert.strictEqual(v.soundMuted, true);
     assert.strictEqual(v.bubbleFollowPet, true);
+    assert.strictEqual(v.mobileNotificationsEnabled, false);
     assert.strictEqual(v.x, 100);
     assert.strictEqual(v.y, -50);
     assert.strictEqual(v.size, "P:15");

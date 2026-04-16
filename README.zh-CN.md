@@ -50,6 +50,7 @@
 - **终端聚焦** — 右键 Clawd → 会话菜单，一键跳转到对应会话的终端窗口；通知/注意状态自动聚焦相关终端
 - **进程存活检测** — 检测已崩溃/退出的 Claude Code 进程，10 秒内清理孤儿会话
 - **启动恢复** — 如果 Clawd 在 Claude Code 运行期间重启，会保持清醒等待 hook，而不是直接睡觉
+- **手机终态通知** — Cursor Agent 和 Codex CLI 的成功/失败可推送到 Pushover 或 Telegram，内置 5 秒去重避免刷屏
 
 ### 系统
 - **点击穿透** — 透明区域的点击直接穿透到下方窗口，只有角色本体可交互
@@ -106,6 +107,35 @@ npm install
 # 启动 Clawd（启动时会自动注册 Claude Code hooks；如需预先手动注册，可单独执行 `node hooks/install.js`）
 npm start
 ```
+
+### 手机通知（Cursor Agent + Codex CLI）
+
+终态手机通知支持 **Cursor Agent** 与 **Codex CLI**，可通过 **Pushover** 或 **Telegram** 推送。
+
+- Cursor 成功：`event=Stop`，或 `event=SessionEnd` 且 `state=sleeping`
+- Cursor 失败：`event=StopFailure` 或 `state=error`
+- Codex 成功：`event=event_msg:task_complete` 且 `state=attention`
+- Codex 失败：`state=error`
+
+启动 Clawd 前可先将 `.env.example` 复制为本地 `.env`；`launch.js` 会自动读取项目根目录 `.env`。
+
+```bash
+# 开启 Pushover
+PUSHOVER_ENABLED=true
+PUSHOVER_APP_TOKEN=your_app_token
+PUSHOVER_USER_KEY=your_user_key
+
+# 开启 Telegram
+TELEGRAM_ENABLED=false
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+```
+
+验证清单：
+- 完成一个 Cursor 任务 -> 手机/手表收到成功通知
+- 构造一个 Cursor 失败任务 -> 手机/手表收到失败通知
+- 完成一个 Codex 任务 -> 手机/手表收到成功通知
+- 短时间重复同一终态事件 -> 去重生效，不会刷屏
 
 **Claude Code** 和 **Codex CLI** 开箱即用。其他 Agent（Copilot、Kiro 等）需一次性配置。也涵盖远程 SSH、WSL 及平台说明（macOS / Linux）：**[docs/setup-guide.zh-CN.md](docs/setup-guide.zh-CN.md)**
 

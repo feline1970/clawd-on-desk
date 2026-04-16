@@ -50,6 +50,7 @@ A desktop pet that reacts to your AI coding agent sessions in real-time. Clawd l
 - **Terminal focus** — right-click Clawd → Sessions menu to jump to a specific session's terminal window; notification/attention states auto-focus the relevant terminal
 - **Process liveness detection** — detects crashed/exited agent processes (Claude Code, Codex, Copilot) and cleans up orphan sessions
 - **Startup recovery** — if Clawd restarts while any agent is running, it stays awake instead of falling asleep
+- **Mobile terminal-result notifications** — Cursor Agent and Codex CLI can push success/failure summaries to Pushover or Telegram, with 5s dedupe to avoid spam
 
 ### System
 - **Click-through** — transparent areas pass clicks to windows below; only Clawd's body is interactive
@@ -106,6 +107,35 @@ npm install
 # Start Clawd (auto-registers Claude Code hooks on launch)
 npm start
 ```
+
+### Mobile Notification (Cursor Agent + Codex CLI)
+
+Terminal-result mobile notifications support **Cursor Agent** and **Codex CLI** through **Pushover** or **Telegram**.
+
+- Cursor success: `event=Stop`, or `event=SessionEnd` with `state=sleeping`
+- Cursor failure: `event=StopFailure` or `state=error`
+- Codex success: `event=event_msg:task_complete` with `state=attention`
+- Codex failure: `state=error`
+
+Create a local `.env` from `.env.example` before starting Clawd. `launch.js` auto-loads the project-root `.env`.
+
+```bash
+# enable Pushover
+PUSHOVER_ENABLED=true
+PUSHOVER_APP_TOKEN=your_app_token
+PUSHOVER_USER_KEY=your_user_key
+
+# enable Telegram
+TELEGRAM_ENABLED=false
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+```
+
+Validation checklist:
+- complete a Cursor task successfully -> phone/watch receives a success notification
+- trigger a failing Cursor task -> phone/watch receives a failure notification
+- complete a Codex task -> phone/watch receives a success notification
+- repeat the same terminal result quickly -> dedupe suppresses notification spam
 
 **Claude Code** and **Codex CLI** work out of the box. Other agents (Copilot, Kiro, etc.) need one-time setup. Also covers remote SSH, WSL, and platform-specific notes (macOS / Linux): **[docs/setup-guide.md](docs/setup-guide.md)**
 

@@ -62,6 +62,7 @@ const SCHEMA = {
   bubbleFollowPet: { type: "boolean", default: false },
   hideBubbles: { type: "boolean", default: false },
   showSessionId: { type: "boolean", default: false },
+  mobileNotificationsEnabled: { type: "boolean", default: true },
   soundMuted: { type: "boolean", default: false },
   // Theme
   theme: { type: "string", default: "clawd" },

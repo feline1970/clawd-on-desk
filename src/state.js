@@ -404,6 +404,18 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
     (srcAgentPid ? isProcessAlive(srcAgentPid) : (srcPid ? isProcessAlive(srcPid) : false));
 
   const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, pidReachable };
+  if (typeof ctx.notifySessionEvent === "function" && srcAgentId) {
+    try {
+      ctx.notifySessionEvent({
+        agentId: srcAgentId,
+        event,
+        state,
+        sessionId,
+        cwd: srcCwd,
+        host: srcHost,
+      });
+    } catch {}
+  }
 
   // Evict oldest session if at capacity and this is a new session
   if (!existing && sessions.size >= MAX_SESSIONS) {

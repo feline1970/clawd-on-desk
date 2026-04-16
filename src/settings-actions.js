@@ -195,6 +195,7 @@ const updateRegistry = {
   bubbleFollowPet: requireBoolean("bubbleFollowPet"),
   hideBubbles: requireBoolean("hideBubbles"),
   showSessionId: requireBoolean("showSessionId"),
+  mobileNotificationsEnabled: requireBoolean("mobileNotificationsEnabled"),
 
   // ── System-backed prefs (object-form: validate + effect pre-commit gate) ──
   //
