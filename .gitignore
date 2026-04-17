@@ -11,6 +11,7 @@ Thumbs.db
 # OpenCode local config
 .opencode/
 # Development plans & review notes
+AGENTS.md
 PLAN.md
 PLAN-*.md
 codex-*.md
