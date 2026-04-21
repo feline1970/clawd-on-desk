@@ -1,6 +1,6 @@
 {
   "name": "clawd-on-desk",
-  "version": "0.5.10",
+  "version": "0.6.0",
   "description": "A desktop pet that reacts to your Claude Code sessions in real-time.",
   "main": "src/main.js",
   "scripts": {
@@ -10,6 +10,7 @@
     "build:linux": "electron-builder --linux",
     "build:all": "electron-builder --win --mac --linux",
     "test": "node --test test/*.test.js",
+    "create-theme": "node scripts/create-theme.js",
     "install:claude-hooks": "node hooks/install.js",
     "uninstall:claude-hooks": "node hooks/uninstall.js",
     "install:gemini-hooks": "node hooks/gemini-install.js",
@@ -85,6 +86,8 @@
     },
     "files": [
       "src/**/*",
+      "assets/icons/**/*",
+      "assets/icons/agents/**/*",
       "assets/svg/**/*",
       "assets/sounds/**/*",
       "assets/tray-icon*.png",
@@ -94,8 +97,10 @@
       "themes/**/*"
     ],
     "asarUnpack": [
+      "assets/svg/**/*",
       "hooks/**/*",
-      "extensions/**/*"
+      "extensions/**/*",
+      "themes/**/*"
     ],
     "extraResources": [
       {

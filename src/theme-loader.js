@@ -56,11 +56,30 @@ const DEFAULT_EYE_TRACKING = {
   shadowOrigin: "7.5px 15px",
 };
 
-const REQUIRED_STATES = ["idle", "working", "thinking", "sleeping", "waking"];
+const REQUIRED_STATES = ["idle", "working", "thinking"];
+const FULL_SLEEP_REQUIRED_STATES = ["yawning", "dozing", "collapsing", "waking"];
+const MINI_REQUIRED_STATES = [
+  "mini-idle",
+  "mini-enter",
+  "mini-enter-sleep",
+  "mini-crabwalk",
+  "mini-peek",
+  "mini-alert",
+  "mini-happy",
+  "mini-sleep",
+];
+const VISUAL_FALLBACK_STATES = new Set([
+  "error",
+  "attention",
+  "notification",
+  "sweeping",
+  "carrying",
+  "sleeping",
+]);
 
 // ── Variant support (Phase 3b-swap) ──
 // Allow-list of fields a variant may override. Anything else → ignored + warned
-// (see docs/plan-settings-panel-3b-swap.md §6.4 Validator Spec rule 1).
+// (see docs/plans/plan-settings-panel-3b-swap.md §6.4 Validator Spec rule 1).
 const VARIANT_ALLOWED_KEYS = new Set([
   // Metadata (not merged into runtime theme)
   "name", "description", "preview",
@@ -86,9 +105,23 @@ const DANGEROUS_TAGS = new Set([
 ]);
 const DANGEROUS_ATTR_RE = /^on/i;
 const DANGEROUS_HREF_RE = /^\s*javascript\s*:/i;
-const EXTERNAL_RESOURCE_RE = /^\s*(https?|data|file|ftp)\s*:/i;
+const EXTERNAL_RESOURCE_RE = /^\s*(?:\/\/|(https?|data|file|ftp)\s*:)/i;
 const PATH_TRAVERSAL_RE = /(?:^|[\\/])\.\.(?:[\\/]|$)/;
 const HREF_ATTRS = new Set(["href", "xlink:href", "src", "action", "formaction"]);
+const SVG_URL_ATTRS = new Set([
+  "style",
+  "fill",
+  "stroke",
+  "filter",
+  "clip-path",
+  "mask",
+  "marker-start",
+  "marker-mid",
+  "marker-end",
+  "cursor",
+]);
+const WINDOWS_ABSOLUTE_PATH_RE = /^[a-zA-Z]:[\\/]/;
+const ROOT_ABSOLUTE_PATH_RE = /^[\\/](?![\\/])/;
 
 // ── State ──
 
@@ -146,12 +179,13 @@ function _scanThemesDir(dir, builtin, themes, seen) {
       if (!entry.isDirectory()) continue;
       if (seen.has(entry.name)) continue;
       const jsonPath = path.join(dir, entry.name, "theme.json");
-      if (!fs.existsSync(jsonPath)) continue;
+      let cfg;
       try {
-        const cfg = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
-        themes.push({ id: entry.name, name: cfg.name || entry.name, path: jsonPath, builtin });
-        seen.add(entry.name);
-      } catch { /* skip malformed */ }
+        cfg = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+      } catch { continue; }
+      if (builtin && cfg && cfg._scaffoldOnly === true) continue;
+      themes.push({ id: entry.name, name: cfg.name || entry.name, path: jsonPath, builtin });
+      seen.add(entry.name);
     }
   } catch { /* dir not found */ }
 }
@@ -205,6 +239,7 @@ function loadTheme(themeId, opts = {}) {
   theme._variantId = resolvedId;
   theme._userOverrides = userOverrides;
   theme._bindingBase = _buildBaseBindingMetadata(afterVariant);
+  theme._capabilities = _buildCapabilities(theme);
 
   // For external themes: sanitize SVGs + resolve asset paths
   if (!isBuiltin) {
@@ -347,6 +382,66 @@ function sanitizeSvg(svgContent) {
   return render.default(doc, { xmlMode: true });
 }
 
+function _unwrapCssUrlTarget(rawValue) {
+  if (typeof rawValue !== "string") return "";
+  const trimmed = rawValue.trim();
+  const singleQuoted = trimmed.startsWith("'") && trimmed.endsWith("'");
+  const doubleQuoted = trimmed.startsWith("\"") && trimmed.endsWith("\"");
+  if ((singleQuoted || doubleQuoted) && trimmed.length >= 2) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function _decodeResourceTarget(target) {
+  if (typeof target !== "string" || !target) return target || "";
+  try {
+    return decodeURIComponent(target);
+  } catch {
+    return target;
+  }
+}
+
+function _hasUnsafeResourcePattern(target) {
+  if (!target) return false;
+  return DANGEROUS_HREF_RE.test(target)
+    || EXTERNAL_RESOURCE_RE.test(target)
+    || PATH_TRAVERSAL_RE.test(target)
+    || WINDOWS_ABSOLUTE_PATH_RE.test(target)
+    || ROOT_ABSOLUTE_PATH_RE.test(target);
+}
+
+function _isUnsafeHrefTarget(rawValue) {
+  const target = _unwrapCssUrlTarget(rawValue);
+  if (!target || target.startsWith("#")) return false;
+  const decoded = _decodeResourceTarget(target);
+  return _hasUnsafeResourcePattern(target) || _hasUnsafeResourcePattern(decoded);
+}
+
+function _isUnsafeCssUrlTarget(rawValue) {
+  const target = _unwrapCssUrlTarget(rawValue);
+  if (!target || target.startsWith("#")) return false;
+  return _isUnsafeHrefTarget(target);
+}
+
+function _sanitizeCssUrls(cssText) {
+  if (typeof cssText !== "string" || !cssText) return cssText;
+  return cssText
+    .replace(/@import\b[^;]*/gi, "/* sanitized */")
+    .replace(/url\s*\(\s*([^)]*?)\s*\)/gi, (match, rawTarget) => (
+      _isUnsafeCssUrlTarget(rawTarget) ? "url()" : match
+    ));
+}
+
+function _containsUnsafeCssUrl(cssText) {
+  if (typeof cssText !== "string" || !cssText) return false;
+  const matches = cssText.matchAll(/url\s*\(\s*([^)]*?)\s*\)/gi);
+  for (const match of matches) {
+    if (_isUnsafeCssUrlTarget(match[1])) return true;
+  }
+  return false;
+}
+
 /**
  * Recursively walk DOM tree and remove dangerous nodes/attributes.
  */
@@ -372,9 +467,7 @@ function _sanitizeNode(node) {
       if (child.children) {
         for (const textNode of child.children) {
           if (textNode.type === "text" && textNode.data) {
-            textNode.data = textNode.data
-              .replace(/@import\b[^;]*/gi, "/* sanitized */")
-              .replace(/url\s*\(\s*(?!['"]?#)[^)]*\)/gi, "url()");
+            textNode.data = _sanitizeCssUrls(textNode.data);
           }
         }
       }
@@ -392,7 +485,18 @@ function _sanitizeNode(node) {
         // Remove javascript: URLs, external protocols, and path traversal
         if (HREF_ATTRS.has(key.toLowerCase())) {
           const val = child.attribs[key];
-          if (DANGEROUS_HREF_RE.test(val) || EXTERNAL_RESOURCE_RE.test(val) || PATH_TRAVERSAL_RE.test(val)) {
+          if (_isUnsafeHrefTarget(val)) {
+            delete child.attribs[key];
+            continue;
+          }
+        }
+        if (SVG_URL_ATTRS.has(key.toLowerCase())) {
+          const val = child.attribs[key];
+          if (key.toLowerCase() === "style") {
+            const sanitized = _sanitizeCssUrls(val);
+            if (!sanitized || !sanitized.trim()) delete child.attribs[key];
+            else child.attribs[key] = sanitized;
+          } else if (_containsUnsafeCssUrl(val)) {
             delete child.attribs[key];
           }
         }
@@ -437,11 +541,9 @@ function getAssetPath(filename) {
   if (!activeTheme) return path.join(assetsSvgDir, filename);
 
   if (activeTheme._builtin) {
-    // Built-in theme with own assets dir (e.g., calico with APNGs)
-    if (!filename.endsWith(".svg")) {
-      const themeAsset = path.join(activeTheme._themeDir, "assets", filename);
-      if (fs.existsSync(themeAsset)) return themeAsset;
-    }
+    // Built-in theme with own assets dir (e.g., calico with APNGs + SVGs)
+    const themeAsset = path.join(activeTheme._themeDir, "assets", filename);
+    if (fs.existsSync(themeAsset)) return themeAsset;
     return path.join(assetsSvgDir, filename);
   }
 
@@ -545,6 +647,8 @@ function ensureUserThemesDir() {
 
 function validateTheme(cfg) {
   const errors = [];
+  const sleepMode = _deriveSleepMode(cfg);
+  const normalizedStates = _normalizeStateBindings(cfg && cfg.states);
 
   if (cfg.schemaVersion !== 1) {
     errors.push(`schemaVersion must be 1, got ${cfg.schemaVersion}`);
@@ -561,23 +665,102 @@ function validateTheme(cfg) {
     errors.push("missing required field: states");
   } else {
     for (const s of REQUIRED_STATES) {
-      if (!cfg.states[s] || !Array.isArray(cfg.states[s]) || cfg.states[s].length === 0) {
+      if (!_hasStateFiles(cfg.states[s])) {
         errors.push(`states.${s} must be a non-empty array`);
       }
+    }
+    if (!_hasStateBinding(cfg.states.sleeping)) {
+      errors.push("states.sleeping must define files or fallbackTo");
+    }
+    if (sleepMode === "full") {
+      for (const s of FULL_SLEEP_REQUIRED_STATES) {
+        if (!_hasStateFiles(cfg.states[s])) {
+          errors.push(`sleepSequence.mode=full requires states.${s} to be a non-empty array`);
+        }
+      }
+    }
+  }
+
+  if (cfg.eyeTracking && cfg.eyeTracking.enabled) {
+    if (!Array.isArray(cfg.eyeTracking.states) || cfg.eyeTracking.states.length === 0) {
+      errors.push("eyeTracking.states must be a non-empty array when eyeTracking.enabled=true");
     }
   }
 
   // eyeTracking.states listed states must use .svg if enabled
   if (cfg.eyeTracking && cfg.eyeTracking.enabled && cfg.states) {
     for (const stateName of (cfg.eyeTracking.states || [])) {
-      const files = cfg.states[stateName] ||
-                    (cfg.miniMode && cfg.miniMode.states && cfg.miniMode.states[stateName]);
+      const files = _getStateFiles(cfg.states[stateName]).length > 0
+        ? _getStateFiles(cfg.states[stateName])
+        : (cfg.miniMode && cfg.miniMode.states && cfg.miniMode.states[stateName]);
       if (files) {
         for (const f of files) {
           if (!f.endsWith(".svg")) {
             errors.push(`eyeTracking state "${stateName}" file "${f}" must be .svg`);
           }
         }
+      }
+    }
+  }
+
+  if (cfg.sleepSequence !== undefined) {
+    const rawMode = cfg.sleepSequence && cfg.sleepSequence.mode;
+    if (rawMode !== "full" && rawMode !== "direct") {
+      errors.push(`sleepSequence.mode must be "full" or "direct", got ${rawMode}`);
+    }
+  }
+
+  const fallbackStateKeys = Object.keys(normalizedStates);
+  for (const stateKey of fallbackStateKeys) {
+    const entry = normalizedStates[stateKey];
+    if (!entry.fallbackTo) continue;
+    if (!VISUAL_FALLBACK_STATES.has(stateKey)) {
+      errors.push(`states.${stateKey}.fallbackTo is only allowed on error/attention/notification/sweeping/carrying/sleeping`);
+      continue;
+    }
+    if (!Object.prototype.hasOwnProperty.call(normalizedStates, entry.fallbackTo)) {
+      errors.push(`states.${stateKey}.fallbackTo target "${entry.fallbackTo}" does not exist`);
+    }
+  }
+
+  for (const stateKey of fallbackStateKeys) {
+    const visited = new Set([stateKey]);
+    let hops = 0;
+    let cursor = stateKey;
+    while (true) {
+      const entry = normalizedStates[cursor];
+      if (!entry || !entry.fallbackTo) break;
+      const target = entry.fallbackTo;
+      hops++;
+      if (hops > 3) {
+        errors.push(`states.${stateKey}.fallbackTo exceeds 3 hop limit`);
+        break;
+      }
+      if (visited.has(target)) {
+        errors.push(`states.${stateKey}.fallbackTo forms a cycle`);
+        break;
+      }
+      visited.add(target);
+      if (!Object.prototype.hasOwnProperty.call(normalizedStates, target)) {
+        break;
+      }
+      cursor = target;
+    }
+    const terminal = normalizedStates[cursor];
+    if (!terminal || !_hasStateFiles(terminal)) {
+      errors.push(`states.${stateKey}.fallbackTo chain does not terminate in real files`);
+    }
+  }
+
+  if (fallbackStateKeys.length > 0 && !fallbackStateKeys.some((stateKey) => _hasStateFiles(normalizedStates[stateKey]))) {
+    errors.push("theme must declare at least one state with real files");
+  }
+
+  if (_isMiniSupported(cfg)) {
+    for (const stateName of MINI_REQUIRED_STATES) {
+      const files = cfg.miniMode.states && cfg.miniMode.states[stateName];
+      if (!Array.isArray(files) || files.length === 0) {
+        errors.push(`miniMode.supported=true requires miniMode.states.${stateName} to be a non-empty array`);
       }
     }
   }
@@ -596,6 +779,97 @@ function validateTheme(cfg) {
 
 function _isPlainObject(v) {
   return v && typeof v === "object" && !Array.isArray(v);
+}
+
+function _hasNonEmptyArray(value) {
+  return Array.isArray(value) && value.length > 0;
+}
+
+function _getStateBindingEntry(entry) {
+  if (Array.isArray(entry)) {
+    return { files: [...entry], fallbackTo: null };
+  }
+  if (_isPlainObject(entry)) {
+    return {
+      files: Array.isArray(entry.files) ? [...entry.files] : [],
+      fallbackTo: (typeof entry.fallbackTo === "string" && entry.fallbackTo) ? entry.fallbackTo : null,
+    };
+  }
+  return { files: [], fallbackTo: null };
+}
+
+function _getStateFiles(entry) {
+  return _getStateBindingEntry(entry).files;
+}
+
+function _hasStateFiles(entry) {
+  return _getStateFiles(entry).length > 0;
+}
+
+function _hasStateBinding(entry) {
+  const normalized = _getStateBindingEntry(entry);
+  return normalized.files.length > 0 || !!normalized.fallbackTo;
+}
+
+function _normalizeStateBindings(states) {
+  const normalized = {};
+  if (!_isPlainObject(states)) return normalized;
+  for (const [stateKey, entry] of Object.entries(states)) {
+    if (stateKey.startsWith("_")) continue;
+    normalized[stateKey] = _getStateBindingEntry(entry);
+  }
+  return normalized;
+}
+
+function _hasReactionBindings(reactions) {
+  if (!_isPlainObject(reactions)) return false;
+  return Object.values(reactions).some((entry) =>
+    _isPlainObject(entry)
+    && (
+      (typeof entry.file === "string" && entry.file.length > 0)
+      || (Array.isArray(entry.files) && entry.files.some((file) => typeof file === "string" && file.length > 0))
+    )
+  );
+}
+
+function _isMiniSupported(cfg) {
+  return !!(_isPlainObject(cfg && cfg.miniMode) && cfg.miniMode.supported !== false);
+}
+
+function _supportsIdleTracking(cfg) {
+  return !!(
+    _isPlainObject(cfg && cfg.eyeTracking)
+    && cfg.eyeTracking.enabled
+    && Array.isArray(cfg.eyeTracking.states)
+    && cfg.eyeTracking.states.includes("idle")
+  );
+}
+
+function _deriveIdleMode(cfg) {
+  if (_supportsIdleTracking(cfg)) return "tracked";
+  if (_hasNonEmptyArray(cfg && cfg.idleAnimations)) return "animated";
+  return "static";
+}
+
+function _deriveSleepMode(cfg) {
+  return (cfg && cfg.sleepSequence && cfg.sleepSequence.mode === "direct") ? "direct" : "full";
+}
+
+function _buildCapabilities(cfg) {
+  return {
+    eyeTracking: !!(
+      _isPlainObject(cfg && cfg.eyeTracking)
+      && cfg.eyeTracking.enabled
+      && _hasNonEmptyArray(cfg.eyeTracking.states)
+    ),
+    miniMode: _isMiniSupported(cfg),
+    idleAnimations: _hasNonEmptyArray(cfg && cfg.idleAnimations),
+    reactions: _hasReactionBindings(cfg && cfg.reactions),
+    workingTiers: _hasNonEmptyArray(cfg && cfg.workingTiers),
+    jugglingTiers: _hasNonEmptyArray(cfg && cfg.jugglingTiers),
+    idleMode: _deriveIdleMode(cfg),
+    sleepMode: _deriveSleepMode(cfg),
+  };
 }
 
 /**
@@ -685,8 +959,17 @@ function _normalizeTransitionOverride(transition) {
 function _buildBaseBindingMetadata(raw) {
   const states = {};
   if (_isPlainObject(raw.states)) {
-    for (const [stateKey, files] of Object.entries(raw.states)) {
-      if (Array.isArray(files) && files[0]) states[stateKey] = _basenameOnly(files[0]);
+    for (const [stateKey, entry] of Object.entries(raw.states)) {
+      if (stateKey.startsWith("_")) continue;
+      const files = _getStateFiles(entry);
+      if (files[0]) states[stateKey] = _basenameOnly(files[0]);
+    }
+  }
+  const miniStates = {};
+  if (_isPlainObject(raw.miniMode) && _isPlainObject(raw.miniMode.states)) {
+    for (const [stateKey, entry] of Object.entries(raw.miniMode.states)) {
+      if (stateKey.startsWith("_")) continue;
+      if (Array.isArray(entry) && entry[0]) miniStates[stateKey] = _basenameOnly(entry[0]);
     }
   }
   const mapTierGroup = (tiers) =>
@@ -699,6 +982,15 @@ function _buildBaseBindingMetadata(raw) {
         }))
         .sort((a, b) => b.minSessions - a.minSessions)
       : [];
+  const idleAnimations = Array.isArray(raw.idleAnimations)
+    ? raw.idleAnimations
+      .filter((entry) => _isPlainObject(entry) && typeof entry.file === "string" && entry.file)
+      .map((entry, index) => ({
+        index,
+        originalFile: _basenameOnly(entry.file),
+        duration: Number.isFinite(entry.duration) ? entry.duration : null,
+      }))
+    : [];
   const displayHintMap = {};
   if (_isPlainObject(raw.displayHintMap)) {
     for (const [key, value] of Object.entries(raw.displayHintMap)) {
@@ -707,8 +999,10 @@ function _buildBaseBindingMetadata(raw) {
   }
   return {
     states,
+    miniStates,
     workingTiers: mapTierGroup(raw.workingTiers),
     jugglingTiers: mapTierGroup(raw.jugglingTiers),
+    idleAnimations,
     displayHintMap,
   };
 }
@@ -732,20 +1026,43 @@ function _applyUserOverridesPatch(raw, overrides) {
   const patched = { ...raw };
 
   const stateOverrides = _isPlainObject(overrides.states) ? overrides.states : {};
-  if (_isPlainObject(raw.states) && Object.keys(stateOverrides).length > 0) {
+  if (Object.keys(stateOverrides).length > 0) {
     const nextStates = { ...raw.states };
+    const nextMiniMode = _isPlainObject(raw.miniMode) ? { ...raw.miniMode } : null;
+    const nextMiniStates = nextMiniMode && _isPlainObject(raw.miniMode.states)
+      ? { ...raw.miniMode.states }
+      : null;
     for (const [stateKey, entry] of Object.entries(stateOverrides)) {
       if (!_isPlainObject(entry)) continue;
-      const currentFiles = Array.isArray(nextStates[stateKey]) ? [...nextStates[stateKey]] : null;
-      if (!currentFiles || currentFiles.length === 0) continue;
+      const rawStateEntry = nextStates[stateKey];
+      const rawMiniEntry = nextMiniStates ? nextMiniStates[stateKey] : undefined;
+      const targetCollection = rawStateEntry !== undefined
+        ? nextStates
+        : (rawMiniEntry !== undefined ? nextMiniStates : null);
+      if (!targetCollection) continue;
+      const currentState = _getStateBindingEntry(targetCollection[stateKey]);
+      const currentFiles = currentState.files;
+      if (currentFiles.length === 0 && !(typeof entry.file === "string" && entry.file)) continue;
+      const nextFiles = [...currentFiles];
       if (typeof entry.file === "string" && entry.file) {
-        currentFiles[0] = entry.file;
+        if (nextFiles.length > 0) nextFiles[0] = entry.file;
+        else nextFiles.push(entry.file);
       }
-      nextStates[stateKey] = currentFiles;
-      const transitionTarget = (typeof entry.file === "string" && entry.file) ? entry.file : currentFiles[0];
+      if (Array.isArray(targetCollection[stateKey])) {
+        targetCollection[stateKey] = nextFiles;
+      } else if (_isPlainObject(targetCollection[stateKey])) {
+        targetCollection[stateKey] = { ...targetCollection[stateKey], files: nextFiles };
+      } else {
+        targetCollection[stateKey] = nextFiles;
+      }
+      const transitionTarget = (typeof entry.file === "string" && entry.file) ? entry.file : nextFiles[0];
       _applyTransitionOverride(patched, transitionTarget, entry.transition);
     }
     patched.states = nextStates;
+    if (nextMiniMode && nextMiniStates) {
+      nextMiniMode.states = nextMiniStates;
+      patched.miniMode = nextMiniMode;
+    }
   }
 
   const tierGroups = _isPlainObject(overrides.tiers) ? overrides.tiers : {};
@@ -780,6 +1097,77 @@ function _applyUserOverridesPatch(raw, overrides) {
       nextTimings.autoReturn[stateKey] = value;
     }
     patched.timings = nextTimings;
+  }
+
+  // Per-file wide-hitbox opt-in/opt-out. Only touches the file list the theme
+  // publishes — doesn't regenerate HIT_BOXES. state.js rebuilds WIDE_SVGS from
+  // theme.wideHitboxFiles on refreshTheme, so the merged list flows through.
+  const hitboxOverrides = _isPlainObject(overrides.hitbox) ? overrides.hitbox : null;
+  const wideOverrides = hitboxOverrides && _isPlainObject(hitboxOverrides.wide) ? hitboxOverrides.wide : null;
+  if (wideOverrides && Object.keys(wideOverrides).length > 0) {
+    const currentSet = new Set(
+      (Array.isArray(patched.wideHitboxFiles) ? patched.wideHitboxFiles : []).map(_basenameOnly)
+    );
+    for (const [file, enabled] of Object.entries(wideOverrides)) {
+      const bn = _basenameOnly(file);
+      if (!bn) continue;
+      if (enabled) currentSet.add(bn);
+      else currentSet.delete(bn);
+    }
+    patched.wideHitboxFiles = [...currentSet];
+  }
+
+  const reactionOverrides = _isPlainObject(overrides.reactions) ? overrides.reactions : null;
+  if (reactionOverrides && _isPlainObject(raw.reactions)) {
+    const nextReactions = { ...raw.reactions };
+    for (const [reactionKey, entry] of Object.entries(reactionOverrides)) {
+      if (!_isPlainObject(entry)) continue;
+      const rawReaction = nextReactions[reactionKey];
+      if (!_isPlainObject(rawReaction)) continue;
+      const nextReaction = { ...rawReaction };
+      const hasNewFile = typeof entry.file === "string" && entry.file;
+      if (hasNewFile) {
+        // `double` reaction stores a files array (random pool). The MVP exposes
+        // only files[0] to users, so overriding replaces the first entry while
+        // keeping the rest of the pool intact.
+        if (Array.isArray(nextReaction.files) && nextReaction.files.length > 0) {
+          nextReaction.files = [entry.file, ...nextReaction.files.slice(1)];
+        } else {
+          nextReaction.file = entry.file;
+        }
+      }
+      if (Number.isFinite(entry.durationMs)) {
+        nextReaction.duration = entry.durationMs;
+      }
+      nextReactions[reactionKey] = nextReaction;
+      const transitionTarget = hasNewFile
+        ? entry.file
+        : (nextReaction.file || (Array.isArray(nextReaction.files) ? nextReaction.files[0] : null));
+      if (transitionTarget) _applyTransitionOverride(patched, transitionTarget, entry.transition);
+    }
+    patched.reactions = nextReactions;
+  }
+
+  const idleAnimationOverrides = _isPlainObject(overrides.idleAnimations) ? overrides.idleAnimations : null;
+  if (idleAnimationOverrides && Array.isArray(raw.idleAnimations)) {
+    const nextIdleAnimations = raw.idleAnimations.map((entry) => (_isPlainObject(entry) ? { ...entry } : entry));
+    for (const [originalFile, entry] of Object.entries(idleAnimationOverrides)) {
+      if (!_isPlainObject(entry)) continue;
+      const cleanOriginal = _basenameOnly(originalFile);
+      const idleAnimation = nextIdleAnimations.find((candidate) =>
+        _isPlainObject(candidate) && _basenameOnly(candidate.file) === cleanOriginal
+      );
+      if (!idleAnimation) continue;
+      if (typeof entry.file === "string" && entry.file) {
+        idleAnimation.file = entry.file;
+      }
+      if (Number.isFinite(entry.durationMs)) {
+        idleAnimation.duration = entry.durationMs;
+      }
+      const transitionTarget = (typeof entry.file === "string" && entry.file) ? entry.file : idleAnimation.file;
+      _applyTransitionOverride(patched, transitionTarget, entry.transition);
+    }
+    patched.idleAnimations = nextIdleAnimations;
   }
 
   return patched;
@@ -912,6 +1300,8 @@ function mergeDefaults(raw, themeId, isBuiltin) {
     ...(raw.eyeTracking && raw.eyeTracking.ids || {}),
   };
 
+  theme.sleepSequence = { mode: _deriveSleepMode(raw) };
+
   // miniMode
   if (raw.miniMode) {
     theme.miniMode = {
@@ -957,8 +1347,16 @@ function mergeDefaults(raw, themeId, isBuiltin) {
 
   // ── Filename sanitization: basename all file references to prevent path traversal ──
   const bn = _basenameOnly;
-  for (const [s, files] of Object.entries(theme.states || {})) {
-    if (Array.isArray(files)) theme.states[s] = files.map(bn);
+  const normalizedStates = _normalizeStateBindings(raw.states);
+  theme.states = {};
+  theme._stateBindings = {};
+  for (const [stateKey, entry] of Object.entries(normalizedStates)) {
+    const files = entry.files.map(bn);
+    theme.states[stateKey] = files;
+    theme._stateBindings[stateKey] = {
+      files,
+      fallbackTo: entry.fallbackTo || null,
+    };
   }
   if (theme.miniMode && theme.miniMode.states) {
     for (const [s, files] of Object.entries(theme.miniMode.states)) {
@@ -1022,7 +1420,7 @@ function getSoundUrl(soundName) {
 // `preview: "../../foo"` can't escape the theme dir.
 function _buildPreviewUrl(raw, themeDir, isBuiltin) {
   const previewFile = (typeof raw.preview === "string" && raw.preview)
-    || (raw.states && Array.isArray(raw.states.idle) && raw.states.idle[0])
+    || _getStateFiles(raw.states && raw.states.idle)[0]
     || null;
   if (!previewFile) return null;
   const filename = path.basename(previewFile);
@@ -1054,6 +1452,7 @@ function getThemeMetadata(themeId) {
     previewContentRatio: _computePreviewContentRatio(raw),
     previewContentOffsetPct: _computePreviewContentOffsetPct(raw),
     variants: _buildVariantMetadata(raw, themeDir, isBuiltin),
+    capabilities: _buildCapabilities(raw),
   };
 }
 
@@ -1108,9 +1507,9 @@ function _scanMetadata(dir, builtin, themes, seen) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isDirectory() || seen.has(entry.name)) continue;
       const jsonPath = path.join(dir, entry.name, "theme.json");
-      if (!fs.existsSync(jsonPath)) continue;
       let raw;
       try { raw = JSON.parse(fs.readFileSync(jsonPath, "utf8")); } catch { continue; }
+      if (builtin && raw && raw._scaffoldOnly === true) continue;
       const themeDir = path.join(dir, entry.name);
       themes.push({
         id: entry.name,
@@ -1120,6 +1519,7 @@ function _scanMetadata(dir, builtin, themes, seen) {
         previewContentRatio: _computePreviewContentRatio(raw),
         previewContentOffsetPct: _computePreviewContentOffsetPct(raw),
         variants: _buildVariantMetadata(raw, themeDir, builtin),
+        capabilities: _buildCapabilities(raw),
       });
       seen.add(entry.name);
     }
@@ -1141,4 +1541,21 @@ module.exports = {
   getHitRendererConfig,
   ensureUserThemesDir,
   getSoundUrl,
+  // Schema constants + helpers — shared with scripts/validate-theme.js to
+  // keep validator and runtime loader from drifting on the same invariants.
+  REQUIRED_STATES,
+  FULL_SLEEP_REQUIRED_STATES,
+  MINI_REQUIRED_STATES,
+  VISUAL_FALLBACK_STATES,
+  isPlainObject: _isPlainObject,
+  hasNonEmptyArray: _hasNonEmptyArray,
+  getStateBindingEntry: _getStateBindingEntry,
+  getStateFiles: _getStateFiles,
+  hasStateFiles: _hasStateFiles,
+  hasStateBinding: _hasStateBinding,
+  normalizeStateBindings: _normalizeStateBindings,
+  hasReactionBindings: _hasReactionBindings,
+  supportsIdleTracking: _supportsIdleTracking,
+  deriveIdleMode: _deriveIdleMode,
+  deriveSleepMode: _deriveSleepMode,
 };

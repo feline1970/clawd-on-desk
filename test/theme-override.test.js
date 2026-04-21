@@ -128,10 +128,10 @@ describe("state.js applyState() gate", () => {
     api = require("../src/state")(ctx);
     ctx._stateChanges.length = 0;
     ctx._sounds.length = 0;
-    api.updateSession(
-      "s1", "any", "PermissionRequest",
-      null, "/tmp", null, null, null, "claude-code", null, false, undefined,
-    );
+    api.updateSession("s1", "any", "PermissionRequest", {
+      cwd: "/tmp",
+      agentId: "claude-code",
+    });
     const played = ctx._stateChanges.map((a) => a[0]);
     assert.ok(!played.includes("notification"), "PermissionRequest 路径不该播 notification");
     assert.ok(!ctx._sounds.includes("confirm"), "不响 confirm");
@@ -170,10 +170,10 @@ describe("state.js applyState() gate", () => {
     ctx = makeCtx({ isOneshotDisabled: disabledSet(new Set(["attention"])) });
     api = require("../src/state")(ctx);
     // 先触发 working session 让 resolveDisplayState 返回 working
-    api.updateSession(
-      "s1", "working", "PreToolUse",
-      null, "/tmp", null, null, null, "claude-code", null, false, undefined,
-    );
+    api.updateSession("s1", "working", "PreToolUse", {
+      cwd: "/tmp",
+      agentId: "claude-code",
+    });
     ctx._stateChanges.length = 0;
     ctx._sounds.length = 0;
     api.applyState("attention");
@@ -469,6 +469,35 @@ describe("setAnimationOverride", () => {
               file: "custom-working.svg",
               transition: { in: 0, out: 90 },
             },
+          },
+        },
+      },
+    });
+  });
+
+  it("写 idleAnimation file + transition + duration，用 originalFile 作 key", () => {
+    const r = action(
+      {
+        themeId: "clawd",
+        slotType: "idleAnimation",
+        originalFile: "idle-look.svg",
+        file: "custom-idle-look.svg",
+        transition: { in: 40, out: 110 },
+        durationMs: 4200,
+      },
+      {
+        snapshot: baseSnap(),
+        activateTheme: () => ({ themeId: "clawd", variantId: "default" }),
+      },
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.themeOverrides, {
+      clawd: {
+        idleAnimations: {
+          "idle-look.svg": {
+            file: "custom-idle-look.svg",
+            transition: { in: 40, out: 110 },
+            durationMs: 4200,
           },
         },
       },

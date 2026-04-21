@@ -20,7 +20,7 @@ function initWithConfig(cfg) {
   _shadowStretch = (tc.eyeTracking && tc.eyeTracking.shadowStretch) || 0.15;
   _shadowShift = (tc.eyeTracking && tc.eyeTracking.shadowShift) || 0.3;
   _eyeTrackingStates = (tc.eyeTrackingStates) || ["idle", "dozing", "mini-idle"];
-  _dragSvg = tc.dragSvg || "clawd-react-drag.svg";
+  _dragSvg = tc.dragSvg || null;
   _idleFollowSvg = tc.idleFollowSvg || "clawd-idle-follow.svg";
   _glyphFlipDefs = tc.glyphFlips || { "pixel-z": 4, "pixel-z-small": 3 };
 
@@ -68,13 +68,13 @@ function applyObjectScaleStyle(el, file) {
     el.style.height = "auto";
     el.style.left = `calc(${_objectScaleCSS.imgLeft} + ${ox}px)`;
     el.style.top = "auto";
-    el.style.bottom = `calc(${_objectScaleCSS.imgBottom || "5%"} + ${oy}px)`;
+    el.style.bottom = `calc(${_objectScaleCSS.imgBottom || "5%"} + ${oy + _viewportOffsetY}px)`;
   } else {
     el.style.width = _objectScaleCSS.width;
     el.style.height = _objectScaleCSS.height;
     el.style.left = `calc(${_objectScaleCSS.left} + ${ox}px)`;
     el.style.top = "auto";
-    el.style.bottom = `calc(${_objectScaleCSS.objBottom} + ${oy}px)`;
+    el.style.bottom = `calc(${_objectScaleCSS.objBottom} + ${oy + _viewportOffsetY}px)`;
   }
 }
 
@@ -106,13 +106,13 @@ function applyNormalizedLayoutStyle(el, file) {
     el.style.height = "auto";
     el.style.left = `calc(${leftRatio * 100}% + ${ox}px)`;
     el.style.top = "auto";
-    el.style.bottom = `calc(${bottomRatio * 100}% + ${oy}px)`;
+    el.style.bottom = `calc(${bottomRatio * 100}% + ${oy + _viewportOffsetY}px)`;
   } else {
     el.style.width = `${widthRatio * 100}%`;
     el.style.height = `${heightRatio * 100}%`;
     el.style.left = `calc(${leftRatio * 100}% + ${ox}px)`;
     el.style.top = "auto";
-    el.style.bottom = `calc(${bottomRatio * 100}% + ${oy}px)`;
+    el.style.bottom = `calc(${bottomRatio * 100}% + ${oy + _viewportOffsetY}px)`;
   }
 }
 
@@ -134,6 +134,17 @@ let _fileOffsets = {};
 let _transitions = {};  // per-file fade config: { "file.apng": { in: 400, out: 400 } }
 let _miniFlipAssets = false; // theme's mini assets drawn in reverse direction
 let _inMiniMode = false;
+let _viewportOffsetY = 0;
+
+function setViewportOffset(offsetY) {
+  const next = Number.isFinite(offsetY) ? Math.max(0, Math.round(offsetY)) : 0;
+  if (next === _viewportOffsetY) return;
+  _viewportOffsetY = next;
+  applyObjectScaleStyle(clawdEl, currentDisplayedSvg);
+  if (pendingNext) {
+    applyObjectScaleStyle(pendingNext, getObjectSvgName(pendingNext));
+  }
+}
 
 function applyMiniFlip(el) {
   if (!el || el.tagName !== "IMG") return;
@@ -157,6 +168,10 @@ window.electronAPI.onThemeConfig((newConfig) => {
   // Clean up layered tracking before reinitializing
   _cleanupLayeredTracking();
   initWithConfig(newConfig);
+});
+
+window.electronAPI.onViewportOffset((offsetY) => {
+  setViewportOffset(offsetY);
 });
 
 // Release an <object> SVG element: navigate away to unload the SVG document
@@ -297,6 +312,7 @@ function cancelReaction() {
 function startDragReaction() {
   if (isDragReacting) return;
   if (dndEnabled) return;
+  if (!_dragSvg) return;
 
   if (isReacting) {
     if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
@@ -431,7 +447,16 @@ function swapToFile(file, state, useObjectChannel) {
     };
 
     next.addEventListener("load", swap, { once: true });
-    next.src = url;
+    // Cache-bust query param: Chromium reuses the SVG document (and its CSS
+    // animation timeline) across <img> elements pointing at the same URL, so
+    // one-shot animations (`animation: foo 3.2s 1 forwards`) that already ran
+    // once would reappear stuck on their last frame on subsequent loads —
+    // the user sees a static pet instead of the entry animation. Appending
+    // a timestamp forces a fresh SVG document & fresh animation start each
+    // swap. Infinite animations are unaffected (they look identical either
+    // way). Load time stays ~0ms since the file itself is still in the HTTP
+    // cache; only the in-memory SVG document is rebuilt.
+    next.src = `${url}${url.includes("?") ? "&" : "?"}_t=${Date.now()}`;
     container.appendChild(next);
     pendingNext = next;
     // Timeout fallback for images that fail to load

@@ -6,12 +6,28 @@
 //
 //   1. UI clicks → settingsAPI.update(key, value) → main → controller
 //   2. Controller commits → broadcasts settings-changed
-//   3. settingsAPI.onChanged fires → renderUI() rebuilds the affected row(s)
+//   3. settingsAPI.onChanged fires → renderer syncs the active tab
 //
-// We never optimistically toggle a switch in the click handler. The visual
-// state always reflects what the store says — period. Failures show a toast
-// and the switch stays in its previous position because the store was never
-// committed.
+// Broadcast state is still authoritative, but controls keep a tiny transient
+// UI layer so switches can animate immediately and slider drags don't get
+// interrupted by high-frequency size broadcasts.
+
+const {
+  SIZE_UI_MIN,
+  SIZE_UI_MAX,
+  SIZE_TICK_VALUES,
+  SIZE_SLIDER_THUMB_DIAMETER,
+  uiSizeToPrefs,
+  prefsSizeToUi,
+  clampSizeUi,
+  sizeUiToPct,
+  getSizeSliderAnchorPx,
+  createSizeSliderController,
+} = globalThis.ClawdSettingsSizeSlider || {};
+
+if (!createSizeSliderController) {
+  throw new Error("settings-size-slider.js failed to load before settings-renderer.js");
+}
 
 // ── i18n (mirror src/i18n.js — bubbles can't require electron modules) ──
 const STRINGS = {
@@ -25,6 +41,24 @@ const STRINGS = {
     sidebarAnimOverrides: "Animation Overrides",
     sidebarShortcuts: "Shortcuts",
     sidebarAbout: "About",
+    shortcutsTitle: "Shortcuts",
+    shortcutsSubtitle: "Set global shortcuts for pet visibility and permission actions. Leave a field empty to unbind it.",
+    shortcutRecordButton: "Change",
+    shortcutClearButton: "Clear",
+    shortcutResetButton: "Reset",
+    shortcutResetAllButton: "Reset All",
+    shortcutRecordingHint: "Press keys (Esc)",
+    shortcutUnassigned: "— unassigned —",
+    shortcutErrorConflict: "Conflict with {other}. Try another key.",
+    shortcutErrorSystemConflict: "Already in use by system or another app.",
+    shortcutErrorReserved: "This combination is reserved. Try another key.",
+    shortcutErrorInvalid: "That key combination is not supported.",
+    shortcutErrorNeedsModifier: "Shortcut must include at least one modifier key.",
+    shortcutErrorRegistrationFailed: "Saved, but currently not active due to system conflict. Rebind or try again later.",
+    shortcutLabelTogglePet: "Toggle pet visibility",
+    shortcutLabelPermissionAllow: "Permission: Allow",
+    shortcutLabelPermissionDeny: "Permission: Deny",
+    shortcutToastSaved: "Shortcut updated",
     sidebarSoon: "Soon",
     sectionAppearance: "Appearance",
     sectionStartup: "Startup",
@@ -57,17 +91,29 @@ const STRINGS = {
     rowHideBubblesDesc: "Suppress permission, notification, and update bubbles entirely.",
     rowShowSessionId: "Show session ID",
     rowShowSessionIdDesc: "Append the short session ID to bubble headers and the Sessions menu.",
+    rowAllowEdgePinning: "Allow pinning to screen edges",
+    rowAllowEdgePinningDesc: "Top/bottom decorations (sparkles, buildings, bubbles, …) may be clipped by the screen edge",
+    rowKeepSizeAcrossDisplays: "Keep size across displays",
+    rowKeepSizeAcrossDisplaysDesc: "Don't auto-resize when moving to another monitor. The slider still adjusts the pet on whichever display it's on.",
+    rowSize: "Size",
+    rowSizeDesc: "Drag to resize the pet.",
     placeholderTitle: "Coming soon",
-    placeholderDesc: "This panel will land in a future Clawd release. The plan lives in docs/plan-settings-panel.md.",
+    placeholderDesc: "This panel will land in a future Clawd release. The plan lives in docs/plans/plan-settings-panel.md.",
     toastSaveFailed: "Couldn't save: ",
     langEnglish: "English",
     langChinese: "中文",
     langKorean: "한국어",
     themeTitle: "Theme",
-    themeSubtitle: "Pick a theme for Clawd. Community themes land in your user themes folder and can be removed from here.",
+    themeSubtitle: "Pick a theme for Clawd. Cards show built-in + capability badges so you can see tracked/static/mini differences before switching.",
     themeEmpty: "No themes available.",
     themeBadgeBuiltin: "Built-in",
     themeBadgeActive: "Active",
+    themeCapabilityTracked: "Tracked idle",
+    themeCapabilityAnimated: "Animated idle",
+    themeCapabilityStatic: "Static theme",
+    themeCapabilityMini: "Mini",
+    themeCapabilityDirectSleep: "Direct sleep",
+    themeCapabilityNoReactions: "No reactions",
     themeActiveIndicator: "\u2713 Active",
     themeThumbMissing: "\u{1F3AD}",
     themeDeleteLabel: "Delete theme",
@@ -95,6 +141,15 @@ const STRINGS = {
     animOverridesOpenThemeTab: "Open Theme tab",
     animOverridesOpenAssets: "Open assets folder",
     animOverridesResetAll: "Reset all to default",
+    animOverridesExport: "Export…",
+    animOverridesImport: "Import…",
+    toastAnimOverridesExportOk: (count, path) =>
+      `Exported overrides for ${count} theme${count === 1 ? "" : "s"} → ${path}`,
+    toastAnimOverridesImportOk: (count) =>
+      `Imported overrides for ${count} theme${count === 1 ? "" : "s"}.`,
+    toastAnimOverridesExportEmpty: "No overrides to export yet.",
+    toastAnimOverridesExportFailed: (message) => `Export failed: ${message}`,
+    toastAnimOverridesImportFailed: (message) => `Import failed: ${message}`,
     animOverridesChangeFile: "Change file",
     animOverridesPreview: "Preview once",
     animOverridesReset: "Reset slot",
@@ -111,7 +166,30 @@ const STRINGS = {
     animOverridesTimingFallback: "theme default",
     animOverridesTimingUnavailable: "unavailable",
     animOverridesDisplayHintWarning: "displayHintMap can override this slot at runtime.",
+    animOverridesFallbackHint: "This slot currently falls back to {state}.",
     animOverridesOverriddenTooltip: "Modified from default",
+    animOverridesUseOwnFile: "Use own file",
+    animOverridesDurationIdle: "Pool hold",
+    animOverridesSectionIdle: "Idle",
+    animOverridesSectionWork: "Work",
+    animOverridesSectionInterrupts: "Interrupts",
+    animOverridesSectionSleep: "Sleep",
+    animOverridesSectionMini: "Mini Mode",
+    animOverridesSectionReactions: "Reactions",
+    animOverridesSectionIdleTracked: "Cursor-follow idle",
+    animOverridesSectionIdleAnimated: "Idle random pool",
+    animOverridesSectionIdleStatic: "Single static idle",
+    animOverridesSectionSleepFull: "Full sleep sequence",
+    animOverridesSectionSleepDirect: "Direct sleep only",
+    animReactionDrag: "Drag (held)",
+    animReactionClickLeft: "Poke (left)",
+    animReactionClickRight: "Poke (right)",
+    animReactionAnnoyed: "Annoyed (rapid poke)",
+    animReactionDouble: "Double-tap",
+    animOverridesWideHitboxToggle: "Wide hitbox",
+    animOverridesWideHitboxDesc: "Use a wider click zone for this frame. Helpful when the visual reaches beyond the default pet silhouette.",
+    animOverridesWideHitboxResetToTheme: "Reset to theme default",
+    animOverridesAspectWarning: "This asset's aspect ratio differs from the original by {pct}% — the hitbox and positioning may need manual tuning.",
     animOverridesExpandRow: "Expand",
     animOverridesModalTitle: "Choose an asset file",
     animOverridesModalSubtitle: "Add files to the current theme assets folder, then refresh the list here.",
@@ -120,6 +198,20 @@ const STRINGS = {
     animOverridesModalUse: "Use this file",
     animOverridesModalCancel: "Cancel",
     animOverridesRefresh: "Refresh list",
+    aboutTitle: "About Clawd",
+    aboutSubtitle: "The pixel crab that watches your AI coding sessions.",
+    aboutTagline: "A desktop companion for your AI coding journey.",
+    aboutVersionLabel: "Version",
+    aboutCheckForUpdates: "Check for Updates",
+    aboutRepositoryLabel: "Repository",
+    aboutLicenseLabel: "License",
+    aboutAuthorLabel: "Made by",
+    aboutContributorsLabel: "Contributors",
+    aboutContributorsShowAll: "Show all",
+    aboutContributorsHide: "Hide",
+    aboutFooter: "Clawd is open source. Built with care by the community.",
+    aboutEasterEggToast: "\u{1F980} Coding shouldn't feel lonely. — Ruller_Lulu / \u9e7f\u9e7f",
+    aboutOpenExternalFailed: "Couldn't open the link in your browser.",
   },
   zh: {
     settingsTitle: "设置",
@@ -131,6 +223,24 @@ const STRINGS = {
     sidebarAnimOverrides: "动画替换",
     sidebarShortcuts: "快捷键",
     sidebarAbout: "关于",
+    shortcutsTitle: "快捷键",
+    shortcutsSubtitle: "为桌宠显隐和权限操作设置全局快捷键。留空即可解绑。",
+    shortcutRecordButton: "修改",
+    shortcutClearButton: "清空",
+    shortcutResetButton: "恢复默认",
+    shortcutResetAllButton: "全部恢复默认",
+    shortcutRecordingHint: "按下组合键（Esc）",
+    shortcutUnassigned: "— 未绑定 —",
+    shortcutErrorConflict: "与 {other} 冲突，请换一个组合键。",
+    shortcutErrorSystemConflict: "该组合键已被系统或其他应用占用。",
+    shortcutErrorReserved: "该组合键属于保留快捷键，请换一个。",
+    shortcutErrorInvalid: "暂不支持这个组合键。",
+    shortcutErrorNeedsModifier: "快捷键至少要包含一个修饰键。",
+    shortcutErrorRegistrationFailed: "已保存，但当前因系统冲突未生效。请重新绑定或稍后再试。",
+    shortcutLabelTogglePet: "显示/隐藏桌宠",
+    shortcutLabelPermissionAllow: "权限：允许",
+    shortcutLabelPermissionDeny: "权限：拒绝",
+    shortcutToastSaved: "快捷键已更新",
     sidebarSoon: "待推出",
     sectionAppearance: "外观",
     sectionStartup: "启动",
@@ -163,17 +273,29 @@ const STRINGS = {
     rowHideBubblesDesc: "完全屏蔽权限、通知和更新气泡。",
     rowShowSessionId: "显示会话 ID",
     rowShowSessionIdDesc: "在气泡标题和会话菜单后追加短会话 ID。",
+    rowAllowEdgePinning: "允许贴靠屏幕边缘",
+    rowAllowEdgePinningDesc: "开启后桌宠贴屏幕边缘时，顶/底装饰（花花、建筑、气泡等）可能被裁掉。",
+    rowKeepSizeAcrossDisplays: "跨显示器保持大小",
+    rowKeepSizeAcrossDisplaysDesc: "移动到另一台显示器时不自动重新缩放。滑块仍按当前显示器的比例调整桌宠。",
+    rowSize: "大小",
+    rowSizeDesc: "拖动调整桌宠大小。",
     placeholderTitle: "即将推出",
-    placeholderDesc: "此面板将在 Clawd 后续版本中加入，规划见 docs/plan-settings-panel.md。",
+    placeholderDesc: "此面板将在 Clawd 后续版本中加入，规划见 docs/plans/plan-settings-panel.md。",
     toastSaveFailed: "保存失败：",
     langEnglish: "English",
     langChinese: "中文",
     langKorean: "한국어",
     themeTitle: "主题",
-    themeSubtitle: "为 Clawd 选择一个主题。社区主题会放在你的用户主题目录里，可以在此删除。",
+    themeSubtitle: "为 Clawd 选择一个主题。卡片会显示内建和能力角标，切换前就能看出 tracked / static / mini 等差异。",
     themeEmpty: "没有可用的主题。",
     themeBadgeBuiltin: "内建",
     themeBadgeActive: "当前",
+    themeCapabilityTracked: "跟随 idle",
+    themeCapabilityAnimated: "动画 idle",
+    themeCapabilityStatic: "静态主题",
+    themeCapabilityMini: "Mini",
+    themeCapabilityDirectSleep: "直睡",
+    themeCapabilityNoReactions: "无反应",
     themeActiveIndicator: "\u2713 当前",
     themeThumbMissing: "\u{1F3AD}",
     themeDeleteLabel: "删除主题",
@@ -201,6 +323,13 @@ const STRINGS = {
     animOverridesOpenThemeTab: "打开主题页",
     animOverridesOpenAssets: "打开素材目录",
     animOverridesResetAll: "全部恢复默认",
+    animOverridesExport: "导出…",
+    animOverridesImport: "导入…",
+    toastAnimOverridesExportOk: (count, path) => `已导出 ${count} 个主题的覆盖 → ${path}`,
+    toastAnimOverridesImportOk: (count) => `已导入 ${count} 个主题的覆盖。`,
+    toastAnimOverridesExportEmpty: "当前没有覆盖可导出。",
+    toastAnimOverridesExportFailed: (message) => `导出失败：${message}`,
+    toastAnimOverridesImportFailed: (message) => `导入失败：${message}`,
     animOverridesChangeFile: "换文件",
     animOverridesPreview: "预览一次",
     animOverridesReset: "恢复槽位",
@@ -217,7 +346,30 @@ const STRINGS = {
     animOverridesTimingFallback: "主题默认值",
     animOverridesTimingUnavailable: "不可用",
     animOverridesDisplayHintWarning: "运行时可能被 displayHintMap 盖掉。",
+    animOverridesFallbackHint: "这个槽位当前回退到 {state}。",
     animOverridesOverriddenTooltip: "已修改（非默认值）",
+    animOverridesUseOwnFile: "使用独立素材",
+    animOverridesDurationIdle: "驻留时长",
+    animOverridesSectionIdle: "Idle",
+    animOverridesSectionWork: "工作态",
+    animOverridesSectionInterrupts: "打扰态",
+    animOverridesSectionSleep: "睡眠",
+    animOverridesSectionMini: "Mini Mode",
+    animOverridesSectionReactions: "反应动画",
+    animOverridesSectionIdleTracked: "跟随鼠标的 idle",
+    animOverridesSectionIdleAnimated: "idle 随机池",
+    animOverridesSectionIdleStatic: "单张静态 idle",
+    animOverridesSectionSleepFull: "完整睡眠序列",
+    animOverridesSectionSleepDirect: "直睡模式",
+    animReactionDrag: "拖拽（按住）",
+    animReactionClickLeft: "戳（左）",
+    animReactionClickRight: "戳（右）",
+    animReactionAnnoyed: "烦躁（连续戳）",
+    animReactionDouble: "双击",
+    animOverridesWideHitboxToggle: "宽点击区",
+    animOverridesWideHitboxDesc: "给这一帧启用更宽的点击区。素材视觉延伸超出默认桌宠轮廓时有用。",
+    animOverridesWideHitboxResetToTheme: "恢复主题默认",
+    animOverridesAspectWarning: "此素材宽高比与原文件差了 {pct}%，点击区和位置可能需要手动校准。",
     animOverridesExpandRow: "展开",
     animOverridesModalTitle: "选择素材文件",
     animOverridesModalSubtitle: "把文件放进当前主题 assets 目录后，可在这里刷新列表重新选择。",
@@ -226,6 +378,20 @@ const STRINGS = {
     animOverridesModalUse: "使用这个文件",
     animOverridesModalCancel: "取消",
     animOverridesRefresh: "刷新列表",
+    aboutTitle: "关于 Clawd",
+    aboutSubtitle: "陪你写代码的像素螃蟹。",
+    aboutTagline: "陪你 AI 编码的桌面伙伴。",
+    aboutVersionLabel: "版本",
+    aboutCheckForUpdates: "检查更新",
+    aboutRepositoryLabel: "代码仓库",
+    aboutLicenseLabel: "开源协议",
+    aboutAuthorLabel: "作者",
+    aboutContributorsLabel: "贡献者",
+    aboutContributorsShowAll: "展开全部",
+    aboutContributorsHide: "收起",
+    aboutFooter: "Clawd 是开源项目 · 与社区一起打造。",
+    aboutEasterEggToast: "\u{1F980} Coding shouldn't feel lonely. — Ruller_Lulu / \u9e7f\u9e7f",
+    aboutOpenExternalFailed: "无法在浏览器中打开链接。",
   },
   ko: {
     settingsTitle: "설정",
@@ -237,6 +403,24 @@ const STRINGS = {
     sidebarAnimOverrides: "애니메이션 오버라이드",
     sidebarShortcuts: "단축키",
     sidebarAbout: "정보",
+    shortcutsTitle: "단축키",
+    shortcutsSubtitle: "펫 표시 전환과 권한 동작에 사용할 전역 단축키를 설정합니다. 비워 두면 해제됩니다.",
+    shortcutRecordButton: "변경",
+    shortcutClearButton: "해제",
+    shortcutResetButton: "기본값 복원",
+    shortcutResetAllButton: "모두 기본값 복원",
+    shortcutRecordingHint: "키 조합 (Esc)",
+    shortcutUnassigned: "— 미지정 —",
+    shortcutErrorConflict: "{other} 와(과) 충돌합니다. 다른 키를 사용해 주세요.",
+    shortcutErrorSystemConflict: "시스템 또는 다른 앱이 이미 사용 중입니다.",
+    shortcutErrorReserved: "예약된 단축키 조합입니다. 다른 키를 사용해 주세요.",
+    shortcutErrorInvalid: "지원하지 않는 키 조합입니다.",
+    shortcutErrorNeedsModifier: "단축키에는 하나 이상의 보조 키가 필요합니다.",
+    shortcutErrorRegistrationFailed: "저장되었지만 현재는 시스템 충돌로 활성화되지 않았습니다. 다시 바인딩하거나 나중에 다시 시도해 주세요.",
+    shortcutLabelTogglePet: "펫 표시 전환",
+    shortcutLabelPermissionAllow: "권한: 허용",
+    shortcutLabelPermissionDeny: "권한: 거부",
+    shortcutToastSaved: "단축키가 업데이트되었습니다",
     sidebarSoon: "예정",
     sectionAppearance: "외관",
     sectionStartup: "시작",
@@ -269,17 +453,29 @@ const STRINGS = {
     rowHideBubblesDesc: "권한, 알림, 업데이트 말풍선을 모두 숨깁니다.",
     rowShowSessionId: "세션 ID 표시",
     rowShowSessionIdDesc: "말풍선 제목과 Sessions 메뉴에 짧은 세션 ID를 덧붙입니다.",
+    rowAllowEdgePinning: "화면 가장자리에 붙이기 허용",
+    rowAllowEdgePinningDesc: "화면 가장자리에 붙을 때 상/하단 장식(반짝임·건물·말풍선 등)이 잘릴 수 있습니다.",
+    rowKeepSizeAcrossDisplays: "디스플레이 간 크기 유지",
+    rowKeepSizeAcrossDisplaysDesc: "다른 모니터로 옮겨도 자동으로 리사이즈하지 않습니다. 슬라이더는 현재 디스플레이 기준으로 계속 작동합니다.",
+    rowSize: "크기",
+    rowSizeDesc: "드래그하여 펫 크기를 조절하세요.",
     placeholderTitle: "곧 제공 예정",
-    placeholderDesc: "이 패널은 향후 Clawd 릴리스에 추가됩니다. 계획은 docs/plan-settings-panel.md에 있습니다.",
+    placeholderDesc: "이 패널은 향후 Clawd 릴리스에 추가됩니다. 계획은 docs/plans/plan-settings-panel.md에 있습니다.",
     toastSaveFailed: "저장 실패: ",
     langEnglish: "English",
     langChinese: "中文",
     langKorean: "한국어",
     themeTitle: "테마",
-    themeSubtitle: "Clawd의 테마를 선택합니다. 커뮤니티 테마는 사용자 테마 폴더에 추가되며 여기서 삭제할 수 있습니다.",
+    themeSubtitle: "Clawd의 테마를 선택합니다. 카드에는 기본 제공/능력 배지가 표시되어 tracked/static/mini 차이를 미리 볼 수 있습니다.",
     themeEmpty: "사용 가능한 테마가 없습니다.",
     themeBadgeBuiltin: "기본 제공",
     themeBadgeActive: "활성",
+    themeCapabilityTracked: "커서 추적 idle",
+    themeCapabilityAnimated: "애니메이션 idle",
+    themeCapabilityStatic: "정적 테마",
+    themeCapabilityMini: "Mini",
+    themeCapabilityDirectSleep: "직접 수면",
+    themeCapabilityNoReactions: "반응 없음",
     themeActiveIndicator: "\u2713 활성",
     themeThumbMissing: "\u{1F3AD}",
     themeDeleteLabel: "테마 삭제",
@@ -307,6 +503,13 @@ const STRINGS = {
     animOverridesOpenThemeTab: "테마 탭 열기",
     animOverridesOpenAssets: "assets 폴더 열기",
     animOverridesResetAll: "모두 기본값으로 복원",
+    animOverridesExport: "내보내기…",
+    animOverridesImport: "가져오기…",
+    toastAnimOverridesExportOk: (count, path) => `${count}개 테마 덮어쓰기를 내보냈습니다 → ${path}`,
+    toastAnimOverridesImportOk: (count) => `${count}개 테마 덮어쓰기를 가져왔습니다.`,
+    toastAnimOverridesExportEmpty: "내보낼 덮어쓰기가 없습니다.",
+    toastAnimOverridesExportFailed: (message) => `내보내기 실패: ${message}`,
+    toastAnimOverridesImportFailed: (message) => `가져오기 실패: ${message}`,
     animOverridesChangeFile: "파일 변경",
     animOverridesPreview: "한 번 미리보기",
     animOverridesReset: "슬롯 초기화",
@@ -323,7 +526,30 @@ const STRINGS = {
     animOverridesTimingFallback: "테마 기본값",
     animOverridesTimingUnavailable: "사용할 수 없음",
     animOverridesDisplayHintWarning: "displayHintMap이 런타임에 이 슬롯을 덮어쓸 수 있습니다.",
+    animOverridesFallbackHint: "이 슬롯은 현재 {state}(으)로 폴백됩니다.",
     animOverridesOverriddenTooltip: "기본값에서 변경됨",
+    animOverridesUseOwnFile: "개별 파일 사용",
+    animOverridesDurationIdle: "유지 시간",
+    animOverridesSectionIdle: "Idle",
+    animOverridesSectionWork: "작업",
+    animOverridesSectionInterrupts: "인터럽트",
+    animOverridesSectionSleep: "수면",
+    animOverridesSectionMini: "Mini Mode",
+    animOverridesSectionReactions: "반응 애니메이션",
+    animOverridesSectionIdleTracked: "커서 추적 idle",
+    animOverridesSectionIdleAnimated: "idle 랜덤 풀",
+    animOverridesSectionIdleStatic: "단일 정적 idle",
+    animOverridesSectionSleepFull: "전체 수면 시퀀스",
+    animOverridesSectionSleepDirect: "직접 수면",
+    animReactionDrag: "드래그 (누름)",
+    animReactionClickLeft: "콕 찌르기 (왼쪽)",
+    animReactionClickRight: "콕 찌르기 (오른쪽)",
+    animReactionAnnoyed: "짜증 (연속 찌르기)",
+    animReactionDouble: "더블탭",
+    animOverridesWideHitboxToggle: "넓은 클릭 영역",
+    animOverridesWideHitboxDesc: "이 프레임에 더 넓은 클릭 영역을 사용합니다. 애셋이 기본 펫 실루엣을 넘어설 때 유용합니다.",
+    animOverridesWideHitboxResetToTheme: "테마 기본값으로 복원",
+    animOverridesAspectWarning: "이 애셋의 가로세로 비율이 원본과 {pct}% 차이납니다. 클릭 영역과 위치를 수동으로 조정해야 할 수 있습니다.",
     animOverridesExpandRow: "펼치기",
     animOverridesModalTitle: "에셋 파일 선택",
     animOverridesModalSubtitle: "파일을 현재 테마의 assets 폴더에 추가한 뒤 여기서 목록을 새로고침하세요.",
@@ -332,8 +558,47 @@ const STRINGS = {
     animOverridesModalUse: "이 파일 사용",
     animOverridesModalCancel: "취소",
     animOverridesRefresh: "목록 새로고침",
+    aboutTitle: "Clawd 정보",
+    aboutSubtitle: "당신의 AI 코딩 세션을 지켜보는 픽셀 게.",
+    aboutTagline: "AI 코딩 여정을 함께하는 데스크톱 동반자.",
+    aboutVersionLabel: "버전",
+    aboutCheckForUpdates: "업데이트 확인",
+    aboutRepositoryLabel: "저장소",
+    aboutLicenseLabel: "라이선스",
+    aboutAuthorLabel: "제작",
+    aboutContributorsLabel: "기여자",
+    aboutContributorsShowAll: "모두 보기",
+    aboutContributorsHide: "접기",
+    aboutFooter: "Clawd는 오픈 소스 · 커뮤니티와 함께 만듭니다.",
+    aboutEasterEggToast: "\u{1F980} Coding shouldn't feel lonely. — Ruller_Lulu / \u9e7f\u9e7f",
+    aboutOpenExternalFailed: "링크를 브라우저에서 열 수 없습니다.",
   },
 };
+
+// Contributors list (README order, hardcoded — update when new contributors land).
+// GitHub usernames don't translate, so this is shared across all locales.
+const CONTRIBUTORS = [
+  "PixelCookie-zyf", "yujiachen-y", "AooooooZzzz", "purefkh", "Tobeabellwether", "Jasonhonghh", "crashchen",
+  "hongbigtou", "InTimmyDate", "NeizhiTouhu", "xu3stones-cmd", "androidZzT", "Ye-0413", "WanfengzzZ",
+  "TaoXieSZ", "ssly", "stickycandy", "Rladmsrl", "YOIMIYA66", "Kevin7Qi", "sefuzhou770801-hub",
+  "Tonic-Jin", "seoki180", "PeterShanxin", "CHIANGANGSTER", "JaeHyeon-KAIST", "TVpoet",
+];
+
+const SHORTCUT_API = globalThis.ClawdShortcutActions || {};
+const SHORTCUT_ACTIONS = SHORTCUT_API.SHORTCUT_ACTIONS || {};
+const SHORTCUT_ACTION_IDS = SHORTCUT_API.SHORTCUT_ACTION_IDS || Object.keys(SHORTCUT_ACTIONS);
+const buildAcceleratorFromEvent = SHORTCUT_API.buildAcceleratorFromEvent
+  || (() => ({ action: "reject", reason: "That key combination is not supported." }));
+const formatAcceleratorLabel = SHORTCUT_API.formatAcceleratorLabel
+  || ((value) => value || "— unassigned —");
+const formatAcceleratorPartial = SHORTCUT_API.formatAcceleratorPartial
+  || (() => "");
+// navigator.platform returns "MacIntel" on macOS (both Intel and Apple
+// Silicon — the latter retains "MacIntel" for web compatibility). The old
+// /\bMac\b/ pattern failed because the trailing \b needs a non-word char
+// after "c", but "I" is a word character. Follow the MDN-recommended check:
+// https://developer.mozilla.org/en-US/docs/Web/API/Navigator/platform
+const IS_MAC = (navigator.platform || "").startsWith("Mac");
 
 let snapshot = null;
 let activeTab = "general";
@@ -350,6 +615,166 @@ let animationOverridesData = null;
 let assetPickerState = null;
 let assetPickerPollTimer = null;
 const expandedOverrideRowIds = new Set();
+let shortcutFailures = {};
+let shortcutFailureToastShown = false;
+let shortcutRecordingActionId = null;
+let shortcutRecordingError = "";
+let shortcutRecordingPartial = [];
+let nextTransientUiSeq = 1;
+
+const GENERAL_IN_PLACE_KEYS = new Set([
+  "size",
+  "soundMuted",
+  "allowEdgePinning",
+  "keepSizeAcrossDisplays",
+  "openAtLogin",
+  "autoStartWithClaude",
+  "bubbleFollowPet",
+  "hideBubbles",
+  "showSessionId",
+]);
+
+const transientUiState = {
+  generalSwitches: new Map(),
+  agentSwitches: new Map(),
+  size: {
+    draftUi: null,
+    dragging: false,
+    pending: false,
+    seq: 0,
+  },
+};
+
+const mountedControls = {
+  generalSwitches: new Map(),
+  agentSwitches: new Map(),
+  size: null,
+};
+
+function clearMountedControls() {
+  if (mountedControls.size && typeof mountedControls.size.dispose === "function") {
+    Promise.resolve(mountedControls.size.dispose()).catch(() => {});
+  }
+  mountedControls.generalSwitches.clear();
+  mountedControls.agentSwitches.clear();
+  mountedControls.size = null;
+}
+
+function readSizeUiFromSnapshot() {
+  const value = snapshot && snapshot.size;
+  if (typeof value === "string" && value.startsWith("P:")) {
+    const parsed = parseFloat(value.slice(2));
+    if (Number.isFinite(parsed) && parsed > 0) return clampSizeUi(prefsSizeToUi(parsed));
+  }
+  return clampSizeUi(prefsSizeToUi(10));
+}
+
+function readGeneralSwitchRaw(key) {
+  return !!(snapshot && snapshot[key]);
+}
+
+function readGeneralSwitchVisual(key, invert = false) {
+  const rawValue = readGeneralSwitchRaw(key);
+  return invert ? !rawValue : rawValue;
+}
+
+function agentSwitchStateId(agentId, flag) {
+  return `${agentId}:${flag}`;
+}
+
+function readAgentFlagValue(agentId, flag) {
+  const entry = snapshot && snapshot.agents && snapshot.agents[agentId];
+  return entry ? entry[flag] !== false : true;
+}
+
+function setSwitchVisual(sw, visualOn, { pending = false } = {}) {
+  sw.classList.toggle("on", !!visualOn);
+  sw.classList.toggle("pending", !!pending);
+  sw.setAttribute("aria-checked", visualOn ? "true" : "false");
+}
+
+function attachAnimatedSwitch(sw, { getCommittedVisual, getTransientState, setTransientState, clearTransientState, invoke }) {
+  const run = () => {
+    if (sw.classList.contains("pending")) return;
+    const currentVisual = getCommittedVisual();
+    const nextVisual = !currentVisual;
+    const seq = nextTransientUiSeq++;
+    setTransientState({ visualOn: nextVisual, pending: true, seq });
+    setSwitchVisual(sw, nextVisual, { pending: true });
+    Promise.resolve()
+      .then(invoke)
+      .then((result) => {
+        const current = getTransientState();
+        if (!current || current.seq !== seq) return;
+        if (!result || result.status !== "ok" || result.noop) {
+          clearTransientState(seq);
+          setSwitchVisual(sw, getCommittedVisual(), { pending: false });
+          if (result && result.noop) return;
+          const msg = (result && result.message) || "unknown error";
+          showToast(t("toastSaveFailed") + msg, { error: true });
+          return;
+        }
+        setTransientState({ visualOn: nextVisual, pending: false, seq });
+        setSwitchVisual(sw, nextVisual, { pending: false });
+      })
+      .catch((err) => {
+        const current = getTransientState();
+        if (!current || current.seq !== seq) return;
+        clearTransientState(seq);
+        setSwitchVisual(sw, getCommittedVisual(), { pending: false });
+        showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+      });
+  };
+  sw.addEventListener("click", run);
+  sw.addEventListener("keydown", (ev) => {
+    if (ev.key === " " || ev.key === "Enter") {
+      ev.preventDefault();
+      run();
+    }
+  });
+}
+
+function syncMountedSizeControl({ fromBroadcast = false } = {}) {
+  const control = mountedControls.size;
+  if (!control || !document.body.contains(control.row)) return false;
+  control.syncFromSnapshot({ fromBroadcast });
+  return true;
+}
+
+function tryPatchActiveTabInPlace(changes) {
+  const keys = changes ? Object.keys(changes) : [];
+  if (keys.length === 0) return false;
+
+  if (activeTab === "general") {
+    if (!keys.every((key) => GENERAL_IN_PLACE_KEYS.has(key))) return false;
+    if (keys.includes("size") && !syncMountedSizeControl({ fromBroadcast: true })) return false;
+    for (const key of keys) {
+      if (key === "size") continue;
+      const meta = mountedControls.generalSwitches.get(key);
+      if (!meta || !document.body.contains(meta.element)) return false;
+    }
+    for (const key of keys) {
+      if (key === "size") continue;
+      const meta = mountedControls.generalSwitches.get(key);
+      transientUiState.generalSwitches.delete(key);
+      setSwitchVisual(meta.element, readGeneralSwitchVisual(key, meta.invert), { pending: false });
+    }
+    return true;
+  }
+
+  if (activeTab === "agents") {
+    if (!(keys.length === 1 && keys[0] === "agents")) return false;
+    if (mountedControls.agentSwitches.size === 0) return false;
+    for (const [id, meta] of mountedControls.agentSwitches) {
+      if (!meta || !document.body.contains(meta.element)) return false;
+      transientUiState.agentSwitches.delete(id);
+      setSwitchVisual(meta.element, readAgentFlagValue(meta.agentId, meta.flag), { pending: false });
+    }
+    return true;
+  }
+
+  return false;
+}
 
 function t(key) {
   const lang = (snapshot && snapshot.lang) || "en";
@@ -381,8 +806,8 @@ const SIDEBAR_TABS = [
   { id: "theme", icon: "\u{1F3A8}", labelKey: "sidebarTheme", available: true },
   { id: "animMap", icon: "\u{1F3AC}", labelKey: "sidebarAnimMap", available: true },
   { id: "animOverrides", icon: "\u{1F39E}", labelKey: "sidebarAnimOverrides", available: true },
-  { id: "shortcuts", icon: "\u2328", labelKey: "sidebarShortcuts", available: false },
-  { id: "about", icon: "\u2139", labelKey: "sidebarAbout", available: false },
+  { id: "shortcuts", icon: "\u2328", labelKey: "sidebarShortcuts", available: true },
+  { id: "about", icon: "\u2139", labelKey: "sidebarAbout", available: true },
 ];
 
 function renderSidebar() {
@@ -412,6 +837,7 @@ function renderSidebar() {
 function renderContent() {
   const content = document.getElementById("content");
   if (activeTab !== "animOverrides" && assetPickerState) closeAssetPicker();
+  clearMountedControls();
   content.innerHTML = "";
   if (activeTab === "general") {
     renderGeneralTab(content);
@@ -423,6 +849,10 @@ function renderContent() {
     renderAnimMapTab(content);
   } else if (activeTab === "animOverrides") {
     renderAnimOverridesTab(content);
+  } else if (activeTab === "shortcuts") {
+    renderShortcutsTab(content);
+  } else if (activeTab === "about") {
+    renderAboutTab(content);
   } else {
     renderPlaceholder(content);
   }
@@ -619,6 +1049,19 @@ function applyThemePreviewOffset(img, offsetPct) {
   img.style.transform = `translate(${x.toFixed(2)}%, ${y.toFixed(2)}%)`;
 }
 
+function getThemeCapabilityBadgeLabels(theme) {
+  const caps = theme && theme.capabilities;
+  if (!caps || typeof caps !== "object") return [];
+  const badges = [];
+  if (caps.idleMode === "tracked") badges.push(t("themeCapabilityTracked"));
+  else if (caps.idleMode === "animated") badges.push(t("themeCapabilityAnimated"));
+  else if (caps.idleMode === "static") badges.push(t("themeCapabilityStatic"));
+  if (caps.miniMode) badges.push(t("themeCapabilityMini"));
+  if (caps.sleepMode === "direct") badges.push(t("themeCapabilityDirectSleep"));
+  if (caps.reactions === false) badges.push(t("themeCapabilityNoReactions"));
+  return badges;
+}
+
 function buildThemeCard(theme) {
   const card = document.createElement("div");
   card.className = "theme-card";
@@ -658,6 +1101,19 @@ function buildThemeCard(theme) {
     name.appendChild(badge);
   }
   card.appendChild(name);
+
+  const capLabels = getThemeCapabilityBadgeLabels(theme);
+  if (capLabels.length) {
+    const caps = document.createElement("div");
+    caps.className = "theme-card-capabilities";
+    for (const label of capLabels) {
+      const badge = document.createElement("span");
+      badge.className = "theme-card-badge";
+      badge.textContent = label;
+      caps.appendChild(badge);
+    }
+    card.appendChild(caps);
+  }
 
   const canDelete = !theme.builtin && !theme.active;
   if (theme.active || canDelete) {
@@ -812,6 +1268,7 @@ function previewStateForCard(card) {
   if (card.slotType === "tier") {
     return card.tierGroup === "jugglingTiers" ? "juggling" : "working";
   }
+  if (card.slotType === "idleAnimation") return "idle";
   return card.stateKey;
 }
 
@@ -824,6 +1281,10 @@ function buildAnimOverrideRequest(card, patch) {
   if (card.slotType === "tier") {
     base.tierGroup = card.tierGroup;
     base.originalFile = card.originalFile;
+  } else if (card.slotType === "idleAnimation") {
+    base.originalFile = card.originalFile;
+  } else if (card.slotType === "reaction") {
+    base.reactionKey = card.reactionKey;
   } else {
     base.stateKey = card.stateKey;
   }
@@ -871,6 +1332,9 @@ function formatSessionRange(minSessions, maxSessions) {
 
 function getAnimOverrideTriggerLabel(card) {
   switch (card.triggerKind) {
+    case "idleTracked": return "Idle follow";
+    case "idleStatic": return "Idle";
+    case "idleAnimation": return `Idle random #${card.poolIndex || 1}`;
     case "thinking": return "UserPromptSubmit";
     case "working": return `PreToolUse (${formatSessionRange(card.minSessions, card.maxSessions)})`;
     case "juggling": return `SubagentStart (${formatSessionRange(card.minSessions, card.maxSessions)})`;
@@ -879,10 +1343,83 @@ function getAnimOverrideTriggerLabel(card) {
     case "notification": return "PermissionRequest";
     case "sweeping": return "PreCompact";
     case "carrying": return "WorktreeCreate";
+    case "yawning": return "Sleep: yawn";
+    case "dozing": return "Sleep: doze";
+    case "collapsing": return "Sleep: collapse";
     case "sleeping": return "60s no events";
     case "waking": return "Wake";
+    case "mini-idle": return "Mini idle";
+    case "mini-enter": return "Mini enter";
+    case "mini-enter-sleep": return "Mini enter sleep";
+    case "mini-crabwalk": return "Mini crabwalk";
+    case "mini-peek": return "Mini peek";
+    case "mini-alert": return "Mini alert";
+    case "mini-happy": return "Mini happy";
+    case "mini-sleep": return "Mini sleep";
+    case "dragReaction": return t("animReactionDrag");
+    case "clickLeftReaction": return t("animReactionClickLeft");
+    case "clickRightReaction": return t("animReactionClickRight");
+    case "annoyedReaction": return t("animReactionAnnoyed");
+    case "doubleReaction": return t("animReactionDouble");
     default: return card.triggerKind || card.stateKey || card.id;
   }
+}
+
+function getAnimOverrideSectionTitle(section) {
+  if (!section || !section.id) return "";
+  switch (section.id) {
+    case "idle": return t("animOverridesSectionIdle");
+    case "work": return t("animOverridesSectionWork");
+    case "interrupts": return t("animOverridesSectionInterrupts");
+    case "sleep": return t("animOverridesSectionSleep");
+    case "mini": return t("animOverridesSectionMini");
+    case "reactions": return t("animOverridesSectionReactions");
+    default: return section.id;
+  }
+}
+
+function getAnimOverrideSectionSubtitle(section) {
+  if (!section) return "";
+  if (section.id === "idle") {
+    if (section.mode === "tracked") return t("animOverridesSectionIdleTracked");
+    if (section.mode === "animated") return t("animOverridesSectionIdleAnimated");
+    if (section.mode === "static") return t("animOverridesSectionIdleStatic");
+  }
+  if (section.id === "sleep") {
+    if (section.mode === "full") return t("animOverridesSectionSleepFull");
+    if (section.mode === "direct") return t("animOverridesSectionSleepDirect");
+  }
+  return "";
+}
+
+function buildAnimOverrideSection(section) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "anim-override-section";
+
+  const head = document.createElement("div");
+  head.className = "anim-override-section-head";
+
+  const title = document.createElement("div");
+  title.className = "section-title";
+  title.textContent = getAnimOverrideSectionTitle(section);
+  head.appendChild(title);
+
+  const subtitleText = getAnimOverrideSectionSubtitle(section);
+  if (subtitleText) {
+    const subtitle = document.createElement("div");
+    subtitle.className = "anim-override-section-subtitle";
+    subtitle.textContent = subtitleText;
+    head.appendChild(subtitle);
+  }
+  wrapper.appendChild(head);
+
+  const list = document.createElement("div");
+  list.className = "anim-override-list";
+  for (const card of (section.cards || [])) {
+    list.appendChild(buildAnimOverrideRow(card));
+  }
+  wrapper.appendChild(list);
+  return wrapper;
 }
 
 function buildAnimPreviewNode(fileUrl) {
@@ -964,19 +1501,68 @@ function renderAnimOverridesTab(parent) {
     })
   );
   themeMeta.appendChild(resetAllBtn);
+
+  const exportBtn = document.createElement("button");
+  exportBtn.type = "button";
+  exportBtn.className = "soft-btn";
+  exportBtn.textContent = t("animOverridesExport");
+  attachActivation(exportBtn, () =>
+    window.settingsAPI.exportAnimationOverrides().then((result) => {
+      if (!result) return result;
+      const lang = (snapshot && snapshot.lang) || "en";
+      const dict = STRINGS[lang] || STRINGS.en;
+      if (result.status === "ok") {
+        showToast(dict.toastAnimOverridesExportOk(result.themeCount || 0, result.path || ""));
+      } else if (result.status === "empty") {
+        showToast(dict.toastAnimOverridesExportEmpty);
+      } else if (result.status === "error") {
+        showToast(dict.toastAnimOverridesExportFailed(result.message || ""), { error: true });
+      }
+      return result;
+    })
+  );
+  themeMeta.appendChild(exportBtn);
+
+  const importBtn = document.createElement("button");
+  importBtn.type = "button";
+  importBtn.className = "soft-btn";
+  importBtn.textContent = t("animOverridesImport");
+  attachActivation(importBtn, () =>
+    window.settingsAPI.importAnimationOverrides().then((result) => {
+      if (!result) return result;
+      const lang = (snapshot && snapshot.lang) || "en";
+      const dict = STRINGS[lang] || STRINGS.en;
+      if (result.status === "ok") {
+        showToast(dict.toastAnimOverridesImportOk(result.themeCount || 0));
+      } else if (result.status === "error") {
+        showToast(dict.toastAnimOverridesImportFailed(result.message || ""), { error: true });
+      }
+      return result;
+    })
+  );
+  themeMeta.appendChild(importBtn);
+
   parent.appendChild(themeMeta);
 
-  const cards = Array.isArray(data.cards) ? data.cards : [];
-  const list = document.createElement("div");
-  list.className = "anim-override-list";
-  for (const card of cards) {
-    list.appendChild(buildAnimOverrideRow(card));
+  const sections = Array.isArray(data.sections) ? data.sections : [];
+  for (const section of sections) {
+    if (!section || !Array.isArray(section.cards) || !section.cards.length) continue;
+    parent.appendChild(buildAnimOverrideSection(section));
   }
-  parent.appendChild(list);
   renderAssetPickerModal();
 }
 
 function triggerPreviewOnce(card) {
+  if (card.slotType === "reaction") {
+    // Reactions live in the renderer's click-reaction layer, not the state
+    // machine — preview through the reaction channel so we don't hijack
+    // working/idle state for a non-logical visual.
+    window.settingsAPI.previewReaction({
+      file: card.currentFile,
+      durationMs: getAnimationPreviewDuration(null, card),
+    });
+    return;
+  }
   window.settingsAPI.previewAnimationOverride({
     stateKey: previewStateForCard(card),
     file: card.currentFile,
@@ -993,6 +1579,10 @@ function isCardOverridden(card) {
     const group = map.tiers && map.tiers[card.tierGroup];
     return !!(group && group[card.originalFile]);
   }
+  if (card.slotType === "idleAnimation") {
+    const group = map.idleAnimations;
+    return !!(group && group[card.originalFile]);
+  }
   const entry = map.states && map.states[card.stateKey];
   if (entry) return true;
   const autoReturn = map.timings && map.timings.autoReturn;
@@ -1002,6 +1592,7 @@ function isCardOverridden(card) {
 function buildAnimOverrideRow(card) {
   const row = document.createElement("details");
   row.className = "anim-override-row";
+  if (card.fallbackTargetState) row.classList.add("inherited");
   row.dataset.rowId = card.id;
   if (expandedOverrideRowIds.has(card.id)) row.open = true;
   row.addEventListener("toggle", () => {
@@ -1051,6 +1642,20 @@ function buildAnimOverrideSummary(card) {
   file.textContent = card.currentFile;
   file.title = card.bindingLabel || "";
   text.appendChild(file);
+  if (card.fallbackTargetState) {
+    const chip = document.createElement("div");
+    chip.className = "anim-override-fallback-chip";
+    chip.title = getAnimFallbackHint(card);
+    const arrow = document.createElement("span");
+    arrow.className = "anim-override-fallback-chip-arrow";
+    arrow.textContent = "\u21B7"; // ↷
+    arrow.setAttribute("aria-hidden", "true");
+    chip.appendChild(arrow);
+    const target = document.createElement("span");
+    target.textContent = card.fallbackTargetState;
+    chip.appendChild(target);
+    text.appendChild(chip);
+  }
   summary.appendChild(text);
 
   const badges = document.createElement("div");
@@ -1076,7 +1681,7 @@ function buildAnimOverrideSummary(card) {
   const changeBtn = document.createElement("button");
   changeBtn.type = "button";
   changeBtn.className = "soft-btn accent anim-override-summary-change";
-  changeBtn.textContent = t("animOverridesChangeFile");
+  changeBtn.textContent = card.fallbackTargetState ? t("animOverridesUseOwnFile") : t("animOverridesChangeFile");
   changeBtn.addEventListener("click", (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
@@ -1087,14 +1692,86 @@ function buildAnimOverrideSummary(card) {
   return summary;
 }
 
+function buildAnimWideHitboxToggle(card) {
+  const row = document.createElement("label");
+  row.className = "anim-override-toggle-row";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = !!card.wideHitboxEnabled;
+  const label = document.createElement("div");
+  label.className = "anim-override-toggle-label";
+  const title = document.createElement("div");
+  title.className = "anim-override-toggle-title";
+  title.textContent = t("animOverridesWideHitboxToggle");
+  label.appendChild(title);
+  const desc = document.createElement("div");
+  desc.className = "anim-override-toggle-desc";
+  desc.textContent = t("animOverridesWideHitboxDesc");
+  label.appendChild(desc);
+  if (card.wideHitboxOverridden) {
+    const badge = document.createElement("button");
+    badge.type = "button";
+    badge.className = "anim-override-reset-chip";
+    badge.textContent = t("animOverridesWideHitboxResetToTheme");
+    badge.addEventListener("click", (e) => {
+      e.preventDefault();
+      const themeId = animationOverridesData && animationOverridesData.theme && animationOverridesData.theme.id;
+      if (!themeId || !card.currentFile) return;
+      window.settingsAPI.command("setWideHitboxOverride", {
+        themeId,
+        file: card.currentFile,
+        enabled: null,
+      }).then((result) => {
+        if (!result || result.status !== "ok" || result.noop) return;
+        return fetchAnimationOverridesData().then(() => {
+          if (activeTab === "animOverrides") renderContent();
+        });
+      });
+    });
+    label.appendChild(badge);
+  }
+  input.addEventListener("change", () => {
+    const themeId = animationOverridesData && animationOverridesData.theme && animationOverridesData.theme.id;
+    if (!themeId || !card.currentFile) return;
+    window.settingsAPI.command("setWideHitboxOverride", {
+      themeId,
+      file: card.currentFile,
+      enabled: input.checked,
+    }).then((result) => {
+      if (!result || result.status !== "ok" || result.noop) return;
+      return fetchAnimationOverridesData().then(() => {
+        if (activeTab === "animOverrides") renderContent();
+      });
+    });
+  });
+  row.appendChild(input);
+  row.appendChild(label);
+  return row;
+}
+
 function buildAnimOverrideDrawer(card) {
   const drawer = document.createElement("div");
   drawer.className = "anim-override-drawer";
+
+  if (card.fallbackTargetState) {
+    const hint = document.createElement("div");
+    hint.className = "anim-override-binding";
+    hint.textContent = getAnimFallbackHint(card);
+    drawer.appendChild(hint);
+  }
 
   if (card.displayHintWarning) {
     const warning = document.createElement("div");
     warning.className = "anim-override-warning";
     warning.textContent = t("animOverridesDisplayHintWarning");
+    drawer.appendChild(warning);
+  }
+
+  if (card.aspectRatioWarning) {
+    const warning = document.createElement("div");
+    warning.className = "anim-override-warning";
+    const diffPct = Math.round(card.aspectRatioWarning.diffRatio * 100);
+    warning.textContent = t("animOverridesAspectWarning").replace("{pct}", String(diffPct));
     drawer.appendChild(warning);
   }
 
@@ -1124,14 +1801,14 @@ function buildAnimOverrideDrawer(card) {
     card.assetCycleMs,
     card.assetCycleStatus
   ));
-  if (card.supportsAutoReturn && card.assetCycleMs == null && card.suggestedDurationMs != null) {
+  if ((card.supportsAutoReturn || card.supportsDuration) && card.assetCycleMs == null && card.suggestedDurationMs != null) {
     info.appendChild(buildAnimTimingHint(
-      t("animOverridesSuggestedTiming"),
+      card.supportsDuration ? t("animOverridesDurationIdle") : t("animOverridesSuggestedTiming"),
       card.suggestedDurationMs,
       card.suggestedDurationStatus
     ));
   }
-  if (!card.supportsAutoReturn) {
+  if (!card.supportsAutoReturn && !card.supportsDuration) {
     const hint = document.createElement("div");
     hint.className = "anim-override-binding";
     hint.textContent = t("animOverridesContinuousHint");
@@ -1172,7 +1849,25 @@ function buildAnimOverrideDrawer(card) {
       },
     }));
   }
+  if (card.supportsDuration) {
+    const current = Number.isFinite(card.durationMs) ? card.durationMs : (card.suggestedDurationMs || 3000);
+    sliders.appendChild(buildAnimOverrideSliderRow({
+      label: t("animOverridesDurationIdle"),
+      min: 500, max: 20000, step: 100,
+      value: current,
+      numberMin: 500,
+      numberMax: 60000,
+      onCommit: (v) => {
+        if (!Number.isFinite(v) || v < 500 || v > 60000) return;
+        return runAnimationOverrideCommand(card, { durationMs: v });
+      },
+    }));
+  }
   drawer.appendChild(sliders);
+
+  if (card.slotType !== "reaction") {
+    drawer.appendChild(buildAnimWideHitboxToggle(card));
+  }
 
   const footer = document.createElement("div");
   footer.className = "anim-override-drawer-footer";
@@ -1181,13 +1876,15 @@ function buildAnimOverrideDrawer(card) {
   resetBtn.className = "soft-btn";
   resetBtn.textContent = t("animOverridesReset");
   resetBtn.disabled = !isCardOverridden(card);
-  attachActivation(resetBtn, () =>
-    runAnimationOverrideCommand(card, {
+  attachActivation(resetBtn, () => {
+    const patch = {
       file: null,
       transition: null,
       ...(card.supportsAutoReturn ? { autoReturnMs: null } : {}),
-    })
-  );
+      ...(card.supportsDuration ? { durationMs: null } : {}),
+    };
+    return runAnimationOverrideCommand(card, patch);
+  });
   footer.appendChild(resetBtn);
   drawer.appendChild(footer);
 
@@ -1246,12 +1943,18 @@ function clampNumber(v, min, max) {
 }
 
 function formatAnimTimingValue(ms, status) {
+  if (status === "static") return "—";
   let text = Number.isFinite(ms) && ms > 0
     ? `${ms} ms`
     : t("animOverridesTimingUnavailable");
   if (status === "estimated") text += ` (${t("animOverridesTimingEstimated")})`;
   else if (status === "fallback") text += ` (${t("animOverridesTimingFallback")})`;
   return text;
+}
+
+function getAnimFallbackHint(card) {
+  if (!card || !card.fallbackTargetState) return "";
+  return t("animOverridesFallbackHint").replace("{state}", card.fallbackTargetState);
 }
 
 function buildAnimTimingHint(label, ms, status) {
@@ -1429,17 +2132,36 @@ function renderAssetPickerModal() {
     return runAnimationOverrideCommand(card, { file: currentSelected.name }).then((result) => {
       if (result && result.status === "ok") {
         closeAssetPicker();
-        if (window.settingsAPI && typeof window.settingsAPI.previewAnimationOverride === "function") {
-          window.settingsAPI.previewAnimationOverride({
-            stateKey: previewStateForCard(card),
-            file: currentSelected.name,
-            durationMs: getAnimationPreviewDuration(currentSelected, card),
-          }).then((previewResult) => {
-            if (!previewResult || previewResult.status === "ok") return;
-            showToast(t("toastSaveFailed") + previewResult.message, { error: true });
-          }).catch((err) => {
-            showToast(t("toastSaveFailed") + (err && err.message), { error: true });
-          });
+        // Skip preview on no-op: the user didn't actually change anything, so
+        // forcing a fresh applyState() on a continuous state (working/thinking/
+        // juggling) would leave the pet stuck on the preview frame for
+        // WORKING_STALE_MS (5 min) when a live CC session keeps resolveDisplayState
+        // pinned to "working". See docs/plans/plan-settings-panel-3b-swap.md Path A MVP
+        // preview semantics.
+        const changed = !result.noop;
+        if (changed) {
+          const previewPromise = card.slotType === "reaction"
+            ? (window.settingsAPI && typeof window.settingsAPI.previewReaction === "function"
+                ? window.settingsAPI.previewReaction({
+                    file: currentSelected.name,
+                    durationMs: getAnimationPreviewDuration(currentSelected, card),
+                  })
+                : null)
+            : (window.settingsAPI && typeof window.settingsAPI.previewAnimationOverride === "function"
+                ? window.settingsAPI.previewAnimationOverride({
+                    stateKey: previewStateForCard(card),
+                    file: currentSelected.name,
+                    durationMs: getAnimationPreviewDuration(currentSelected, card),
+                  })
+                : null);
+          if (previewPromise) {
+            previewPromise.then((previewResult) => {
+              if (!previewResult || previewResult.status === "ok") return;
+              showToast(t("toastSaveFailed") + previewResult.message, { error: true });
+            }).catch((err) => {
+              showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+            });
+          }
         }
       }
       return result;
@@ -1540,20 +2262,33 @@ function buildAgentSwitchRow({ agent, flag, extraClass, buildText }) {
   sw.className = "switch";
   sw.setAttribute("role", "switch");
   sw.setAttribute("tabindex", "0");
-  const readFlag = () => {
-    const entry = snapshot && snapshot.agents && snapshot.agents[agent.id];
-    return entry ? entry[flag] !== false : true;
-  };
-  const on = readFlag();
-  if (on) sw.classList.add("on");
-  sw.setAttribute("aria-checked", on ? "true" : "false");
-  attachActivation(sw, () =>
+  const stateId = agentSwitchStateId(agent.id, flag);
+  const override = transientUiState.agentSwitches.get(stateId);
+  const committedVisual = readAgentFlagValue(agent.id, flag);
+  setSwitchVisual(sw, override ? override.visualOn : committedVisual, {
+    pending: override ? override.pending : false,
+  });
+  mountedControls.agentSwitches.set(stateId, {
+    element: sw,
+    agentId: agent.id,
+    flag,
+  });
+  attachAnimatedSwitch(sw, {
+    getCommittedVisual: () => readAgentFlagValue(agent.id, flag),
+    getTransientState: () => transientUiState.agentSwitches.get(stateId) || null,
+    setTransientState: (value) => transientUiState.agentSwitches.set(stateId, value),
+    clearTransientState: (seq) => {
+      const current = transientUiState.agentSwitches.get(stateId);
+      if (!current || (seq !== undefined && current.seq !== seq)) return;
+      transientUiState.agentSwitches.delete(stateId);
+    },
+    invoke: () =>
     window.settingsAPI.command("setAgentFlag", {
       agentId: agent.id,
       flag,
-      value: !readFlag(),
-    })
-  );
+      value: !readAgentFlagValue(agent.id, flag),
+    }),
+  });
   ctrl.appendChild(sw);
   row.appendChild(ctrl);
   return row;
@@ -1582,12 +2317,23 @@ function renderGeneralTab(parent) {
   // Section: Appearance
   parent.appendChild(buildSection(t("sectionAppearance"), [
     buildLanguageRow(),
+    buildSizeSliderRow(),
     buildSwitchRow({
       key: "soundMuted",
       labelKey: "rowSound",
       descKey: "rowSoundDesc",
       // soundMuted is inverse: ON-switch means sound enabled.
       invert: true,
+    }),
+    buildSwitchRow({
+      key: "allowEdgePinning",
+      labelKey: "rowAllowEdgePinning",
+      descKey: "rowAllowEdgePinningDesc",
+    }),
+    buildSwitchRow({
+      key: "keepSizeAcrossDisplays",
+      labelKey: "rowKeepSizeAcrossDisplays",
+      descKey: "rowKeepSizeAcrossDisplaysDesc",
     }),
   ]));
 
@@ -1713,10 +2459,10 @@ function buildSwitchRow({
   }
   const sw = row.querySelector(".switch");
   const control = row.querySelector(".row-control");
-  const rawValue = !!(snapshot && snapshot[key]);
-  const visualOn = invert ? !rawValue : rawValue;
-  if (visualOn) sw.classList.add("on");
-  sw.setAttribute("aria-checked", visualOn ? "true" : "false");
+  const override = transientUiState.generalSwitches.get(key);
+  const visualOn = override ? override.visualOn : readGeneralSwitchVisual(key, invert);
+  setSwitchVisual(sw, visualOn, { pending: override ? override.pending : false });
+  mountedControls.generalSwitches.set(key, { element: sw, invert });
   if (actionButton) {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -1731,16 +2477,25 @@ function buildSwitchRow({
     sw.tabIndex = -1;
     return row;
   }
-  // No optimistic update — visual state flips on broadcast, not on click.
-  // If the action fails, the broadcast never fires and the switch stays.
-  attachActivation(sw, () => {
-    const currentRaw = !!(snapshot && snapshot[key]);
-    const currentVisual = invert ? !currentRaw : currentRaw;
-    const nextRaw = invert ? currentVisual : !currentVisual;
-    if (typeof onToggle === "function") {
-      return onToggle({ currentRaw, currentVisual, nextRaw });
-    }
-    return window.settingsAPI.update(key, nextRaw);
+  attachAnimatedSwitch(sw, {
+    getCommittedVisual: () => readGeneralSwitchVisual(key, invert),
+    getTransientState: () => transientUiState.generalSwitches.get(key) || null,
+    setTransientState: (value) => transientUiState.generalSwitches.set(key, value),
+    clearTransientState: (seq) => {
+      const current = transientUiState.generalSwitches.get(key);
+      if (!current || (seq !== undefined && current.seq !== seq)) return;
+      transientUiState.generalSwitches.delete(key);
+    },
+    invoke: () => {
+      const currentRaw = readGeneralSwitchRaw(key);
+      const currentVisual = invert ? !currentRaw : currentRaw;
+      const nextVisual = !currentVisual;
+      const nextRaw = invert ? !nextVisual : nextVisual;
+      if (typeof onToggle === "function") {
+        return onToggle({ currentRaw, currentVisual, nextRaw });
+      }
+      return window.settingsAPI.update(key, nextRaw);
+    },
   });
   return row;
 }
@@ -1810,6 +2565,627 @@ function buildLanguageRow() {
   return row;
 }
 
+function buildSizeSliderRow() {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.innerHTML =
+    `<div class="row-text">` +
+      `<span class="row-label"></span>` +
+      `<span class="row-desc"></span>` +
+    `</div>` +
+    `<div class="row-control size-control">` +
+      `<div class="size-slider-wrap">` +
+        `<div class="size-bubble"></div>` +
+        `<input type="range" class="size-slider" min="${SIZE_UI_MIN}" max="${SIZE_UI_MAX}" step="1" />` +
+      `</div>` +
+      `<div class="size-ticks"></div>` +
+    `</div>`;
+  row.querySelector(".row-label").textContent = t("rowSize");
+  row.querySelector(".row-desc").textContent = t("rowSizeDesc");
+
+  const control = row.querySelector(".size-control");
+  const sliderWrap = row.querySelector(".size-slider-wrap");
+  const slider = row.querySelector(".size-slider");
+  const bubble = row.querySelector(".size-bubble");
+  const ticksEl = row.querySelector(".size-ticks");
+  const tickMarks = [];
+
+  function readThumbDiameterPx() {
+    const raw = window.getComputedStyle(slider).getPropertyValue("--size-slider-thumb-diameter");
+    const parsed = parseFloat(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : SIZE_SLIDER_THUMB_DIAMETER;
+  }
+
+  function getSliderAnchorPx(ui) {
+    return getSizeSliderAnchorPx({
+      value: ui,
+      min: SIZE_UI_MIN,
+      max: SIZE_UI_MAX,
+      sliderWidth: slider.clientWidth,
+      thumbDiameter: readThumbDiameterPx(),
+    });
+  }
+
+  function repositionScaleGeometry(ui) {
+    const anchorPx = getSliderAnchorPx(ui);
+    bubble.style.left = `${anchorPx}px`;
+    for (const tick of tickMarks) {
+      tick.element.style.left = `${getSliderAnchorPx(tick.value)}px`;
+    }
+  }
+
+  function applyLocalValue(ui) {
+    const pct = sizeUiToPct(ui);
+    slider.value = String(ui);
+    slider.style.setProperty("--size-fill", `${pct}%`);
+    bubble.textContent = `${ui}%`;
+    repositionScaleGeometry(ui);
+  }
+
+  function setDragging(nextDragging, pending = transientUiState.size.pending) {
+    control.classList.toggle("dragging", !!nextDragging);
+    control.classList.toggle("pending", !!pending);
+  }
+
+  const initial =
+    transientUiState.size.draftUi === null ? readSizeUiFromSnapshot() : transientUiState.size.draftUi;
+  applyLocalValue(initial);
+  setDragging(transientUiState.size.dragging, transientUiState.size.pending);
+
+  for (const v of SIZE_TICK_VALUES) {
+    const mark = document.createElement("span");
+    mark.className = "size-tick";
+    mark.dataset.value = String(v);
+    const dot = document.createElement("span");
+    dot.className = "size-tick-dot";
+    const label = document.createElement("span");
+    label.className = "size-tick-label";
+    label.textContent = String(v);
+    mark.appendChild(dot);
+    mark.appendChild(label);
+    ticksEl.appendChild(mark);
+    tickMarks.push({ value: v, element: mark });
+  }
+
+  const controller = createSizeSliderController({
+    readSnapshotUi: readSizeUiFromSnapshot,
+    settingsAPI: window.settingsAPI,
+    onLocalValue: (ui) => {
+      transientUiState.size.draftUi = ui;
+      applyLocalValue(ui);
+    },
+    onDraggingChange: (dragging, pending) => {
+      transientUiState.size.dragging = dragging;
+      transientUiState.size.pending = pending;
+      setDragging(dragging, pending);
+    },
+    onError: (message) => {
+      transientUiState.size.draftUi = null;
+      applyLocalValue(readSizeUiFromSnapshot());
+      if (message) showToast(t("toastSaveFailed") + message, { error: true });
+    },
+  });
+
+  mountedControls.size = {
+    row,
+    syncFromSnapshot: (options) => controller.syncFromSnapshot(options),
+    dispose: () => {
+      if (resizeObserver) resizeObserver.disconnect();
+      window.removeEventListener("resize", handleGeometryRefresh);
+      return controller.dispose();
+    },
+  };
+  controller.syncFromSnapshot();
+
+  function handleGeometryRefresh() {
+    const currentUi =
+      transientUiState.size.draftUi === null ? readSizeUiFromSnapshot() : transientUiState.size.draftUi;
+    repositionScaleGeometry(currentUi);
+  }
+
+  let resizeObserver = null;
+  if (typeof ResizeObserver === "function") {
+    resizeObserver = new ResizeObserver(() => {
+      handleGeometryRefresh();
+    });
+    resizeObserver.observe(sliderWrap);
+  }
+  window.addEventListener("resize", handleGeometryRefresh);
+  handleGeometryRefresh();
+
+  slider.addEventListener("pointerdown", () => { void controller.pointerDown(); });
+  slider.addEventListener("pointerup", () => { void controller.pointerUp(); });
+  slider.addEventListener("pointercancel", () => { void controller.pointerCancel(); });
+  slider.addEventListener("blur", () => { void controller.blur(); });
+  slider.addEventListener("input", () => {
+    void controller.input(Number(slider.value));
+  });
+  slider.addEventListener("change", () => {
+    void controller.change(Number(slider.value));
+  });
+
+  return row;
+}
+
+function getShortcutActionLabel(actionId) {
+  const meta = SHORTCUT_ACTIONS[actionId];
+  return meta ? t(meta.labelKey) : actionId;
+}
+
+function getShortcutValue(actionId) {
+  const shortcuts = snapshot && snapshot.shortcuts;
+  if (!shortcuts || typeof shortcuts !== "object") return null;
+  return shortcuts[actionId] ?? null;
+}
+
+function translateShortcutError(message) {
+  if (!message) return "";
+  const conflictMatch = /^conflict: already bound to (.+)$/.exec(message);
+  if (conflictMatch) {
+    return t("shortcutErrorConflict").replace("{other}", getShortcutActionLabel(conflictMatch[1]));
+  }
+  if (message === "reserved accelerator") return t("shortcutErrorReserved");
+  if (message === "invalid accelerator format") return t("shortcutErrorInvalid");
+  if (message === "must include modifier") return t("shortcutErrorNeedsModifier");
+  if (message.includes("unregister of old accelerator failed")) return t("shortcutErrorSystemConflict");
+  if (message.includes("system conflict")) return t("shortcutErrorSystemConflict");
+  return message;
+}
+
+function finishShortcutRecording() {
+  if (!shortcutRecordingActionId) return Promise.resolve();
+  shortcutRecordingActionId = null;
+  shortcutRecordingError = "";
+  shortcutRecordingPartial = [];
+  if (activeTab === "shortcuts") renderContent();
+  if (!window.settingsAPI || typeof window.settingsAPI.exitShortcutRecording !== "function") {
+    return Promise.resolve();
+  }
+  return window.settingsAPI.exitShortcutRecording().catch(() => {});
+}
+
+function cancelShortcutRecording() {
+  return finishShortcutRecording();
+}
+
+function enterShortcutRecording(actionId) {
+  if (!window.settingsAPI || typeof window.settingsAPI.enterShortcutRecording !== "function") {
+    showToast(t("toastSaveFailed") + "settings API unavailable", { error: true });
+    return;
+  }
+  shortcutRecordingError = "";
+  shortcutRecordingPartial = [];
+  window.settingsAPI.enterShortcutRecording(actionId).then((result) => {
+    if (!result || result.status !== "ok") {
+      showToast(t("toastSaveFailed") + ((result && result.message) || "unknown error"), { error: true });
+      return;
+    }
+    shortcutRecordingActionId = actionId;
+    shortcutRecordingError = "";
+    shortcutRecordingPartial = [];
+    if (activeTab === "shortcuts") renderContent();
+  }).catch((err) => {
+    showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+  });
+}
+
+function handleShortcutRecordKey(payload) {
+  if (!shortcutRecordingActionId) return;
+  const built = buildAcceleratorFromEvent(payload, { isMac: IS_MAC });
+  if (!built) return;
+  if (built.action === "pending") {
+    // Update live preview of modifiers held down so the user can see
+    // "Ctrl+Shift+…" build up before the final non-modifier key commits.
+    const nextPartial = Array.isArray(built.modifiers) ? built.modifiers : [];
+    const changed = nextPartial.length !== shortcutRecordingPartial.length
+      || nextPartial.some((m, i) => m !== shortcutRecordingPartial[i]);
+    if (changed) {
+      shortcutRecordingPartial = nextPartial;
+      if (activeTab === "shortcuts") renderContent();
+    }
+    return;
+  }
+  if (built.action === "cancel") {
+    cancelShortcutRecording();
+    return;
+  }
+  if (built.action === "reject") {
+    shortcutRecordingError = translateShortcutError(built.reason);
+    shortcutRecordingPartial = [];
+    if (activeTab === "shortcuts") renderContent();
+    return;
+  }
+  const targetActionId = shortcutRecordingActionId;
+  const prevValue = getShortcutValue(targetActionId);
+  window.settingsAPI.command("registerShortcut", {
+    actionId: targetActionId,
+    accelerator: built.accelerator,
+  }).then((result) => {
+    if (result && result.status === "ok") {
+      finishShortcutRecording();
+      // Only toast when the value actually changed — if the user re-entered
+      // the same combo (noop), don't pretend something was saved.
+      if (prevValue !== built.accelerator) {
+        showToast(t("shortcutToastSaved"));
+      }
+      return;
+    }
+    shortcutRecordingError = translateShortcutError(result && result.message);
+    if (activeTab === "shortcuts") renderContent();
+  }).catch((err) => {
+    shortcutRecordingError = (err && err.message) || "";
+    if (activeTab === "shortcuts") renderContent();
+  });
+}
+
+function runShortcutAction(action, payload) {
+  if (!window.settingsAPI || typeof window.settingsAPI.command !== "function") {
+    showToast(t("toastSaveFailed") + "settings API unavailable", { error: true });
+    return;
+  }
+  window.settingsAPI.command(action, payload).then((result) => {
+    if (!result || result.status !== "ok") {
+      const message = translateShortcutError(result && result.message)
+        || (t("toastSaveFailed") + "unknown error");
+      showToast(message, { error: true });
+    }
+  }).catch((err) => {
+    showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+  });
+}
+
+function buildShortcutButton(label, onClick, { disabled = false, accent = false } = {}) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "soft-btn" + (accent ? " accent" : "");
+  btn.textContent = label;
+  if (disabled) {
+    btn.disabled = true;
+    return btn;
+  }
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+function buildShortcutRow(actionId) {
+  const row = document.createElement("div");
+  row.className = "row shortcut-row";
+  row.dataset.shortcutActionId = actionId;
+
+  const textWrap = document.createElement("div");
+  textWrap.className = "row-text";
+  const label = document.createElement("span");
+  label.className = "row-label";
+  label.textContent = getShortcutActionLabel(actionId);
+  textWrap.appendChild(label);
+
+  const status = document.createElement("span");
+  status.className = "row-desc";
+  const isRecording = shortcutRecordingActionId === actionId;
+  const failure = shortcutFailures && shortcutFailures[actionId];
+  if (isRecording) {
+    // Only surface errors here — the value box below already shows the
+    // recording hint / live partial preview, so duplicating it in the left
+    // column just makes it wrap to 3 lines and looks bad.
+    if (shortcutRecordingError) {
+      status.classList.add("shortcut-status-recording");
+      status.textContent = shortcutRecordingError;
+    } else {
+      status.textContent = "";
+    }
+  } else if (failure) {
+    status.classList.add("shortcut-status-warning");
+    status.textContent = t("shortcutErrorRegistrationFailed");
+  } else {
+    status.textContent = "";
+  }
+  textWrap.appendChild(status);
+  row.appendChild(textWrap);
+
+  const control = document.createElement("div");
+  control.className = "row-control shortcut-row-control";
+  const value = document.createElement("div");
+  value.className = "shortcut-value";
+  if (!getShortcutValue(actionId)) value.classList.add("unassigned");
+  if (isRecording) value.classList.add("recording");
+  if (isRecording) {
+    // Show "Ctrl+Shift+…" live as the user holds modifiers, fall back to
+    // the hint until any modifier is pressed.
+    const partial = shortcutRecordingPartial.length > 0
+      ? formatAcceleratorPartial(shortcutRecordingPartial, { isMac: IS_MAC })
+      : "";
+    value.textContent = partial || t("shortcutRecordingHint");
+  } else {
+    value.textContent = formatAcceleratorLabel(getShortcutValue(actionId), {
+      isMac: IS_MAC,
+      unassignedLabel: t("shortcutUnassigned"),
+    });
+  }
+  control.appendChild(value);
+
+  if (failure && !isRecording) {
+    const warning = document.createElement("span");
+    warning.className = "shortcut-warning";
+    warning.textContent = "⚠";
+    warning.title = t("shortcutErrorRegistrationFailed");
+    control.appendChild(warning);
+  }
+
+  // While any row is recording, lock down every row's action buttons (the
+  // recording row's too — otherwise the user can hit Clear/Reset mid-capture
+  // and break the "keyboard or Esc only" contract). Reset All follows the
+  // same rule below.
+  const anyRecording = !!shortcutRecordingActionId;
+  control.appendChild(buildShortcutButton(
+    t("shortcutRecordButton"),
+    () => enterShortcutRecording(actionId),
+    { disabled: anyRecording }
+  ));
+  control.appendChild(buildShortcutButton(
+    t("shortcutClearButton"),
+    () => runShortcutAction("registerShortcut", { actionId, accelerator: null }),
+    { disabled: anyRecording || getShortcutValue(actionId) === null }
+  ));
+  control.appendChild(buildShortcutButton(
+    t("shortcutResetButton"),
+    () => runShortcutAction("resetShortcut", { actionId }),
+    { disabled: anyRecording }
+  ));
+
+  row.appendChild(control);
+  return row;
+}
+
+function renderShortcutsTab(parent) {
+  const h1 = document.createElement("h1");
+  h1.textContent = t("shortcutsTitle");
+  parent.appendChild(h1);
+
+  const subtitle = document.createElement("p");
+  subtitle.className = "subtitle";
+  subtitle.textContent = t("shortcutsSubtitle");
+  parent.appendChild(subtitle);
+
+  const head = document.createElement("div");
+  head.className = "shortcuts-head";
+  head.appendChild(document.createElement("div"));
+  head.appendChild(buildShortcutButton(
+    t("shortcutResetAllButton"),
+    () => runShortcutAction("resetAllShortcuts", null),
+    { disabled: !!shortcutRecordingActionId, accent: true }
+  ));
+  parent.appendChild(head);
+
+  const rows = SHORTCUT_ACTION_IDS.map((actionId) => buildShortcutRow(actionId));
+  parent.appendChild(buildSection("", rows));
+}
+
+// ── About tab ──
+//
+// Hero: Clawd "Deal with it" intro → freeze at cool pose (4.4s), then breathing.
+// Click counter on the crab (7 reveals the easter-egg toast).
+// Info rows (version / repo / license / author), collapsible contributors grid, footer.
+let aboutInfoCache = null;
+let aboutClickCount = 0;
+let aboutContributorsExpanded = false;
+
+function fetchAboutInfo() {
+  if (aboutInfoCache) return Promise.resolve(aboutInfoCache);
+  if (!window.settingsAPI || typeof window.settingsAPI.getAboutInfo !== "function") {
+    return Promise.resolve(null);
+  }
+  return window.settingsAPI.getAboutInfo().then((info) => {
+    aboutInfoCache = info;
+    return info;
+  }).catch(() => null);
+}
+
+function openExternalSafe(url) {
+  if (!url) return;
+  if (!window.settingsAPI || typeof window.settingsAPI.openExternal !== "function") return;
+  window.settingsAPI.openExternal(url).then((result) => {
+    if (result && result.status === "error") {
+      showToast(t("aboutOpenExternalFailed"), { error: true });
+    }
+  }).catch(() => {
+    showToast(t("aboutOpenExternalFailed"), { error: true });
+  });
+}
+
+function handleAboutCrabClick(crabWrap) {
+  const slot = crabWrap.querySelector("#shake-slot");
+  if (slot) {
+    slot.classList.remove("shake");
+    void slot.getBoundingClientRect();
+    slot.classList.add("shake");
+    const onEnd = () => {
+      slot.classList.remove("shake");
+      slot.removeEventListener("animationend", onEnd);
+    };
+    slot.addEventListener("animationend", onEnd);
+  }
+  aboutClickCount++;
+  if (aboutClickCount >= 7) {
+    aboutClickCount = 0;
+    showToast(t("aboutEasterEggToast"), { ttl: 5000 });
+  }
+}
+
+function buildAboutLinkRow(label, url, displayText) {
+  const row = document.createElement("div");
+  row.className = "about-info-row";
+  const l = document.createElement("div");
+  l.className = "about-info-label";
+  l.textContent = label;
+  const v = document.createElement("div");
+  v.className = "about-info-value";
+  const a = document.createElement("a");
+  a.href = "#";
+  a.textContent = displayText;
+  a.addEventListener("click", (e) => {
+    e.preventDefault();
+    openExternalSafe(url);
+  });
+  v.appendChild(a);
+  row.appendChild(l);
+  row.appendChild(v);
+  return row;
+}
+
+function renderAboutTab(parent) {
+  // Hero: SVG + title + tagline
+  const hero = document.createElement("div");
+  hero.className = "about-hero";
+
+  const crabWrap = document.createElement("div");
+  crabWrap.className = "about-crab-wrap";
+  crabWrap.title = "Clawd";
+
+  const title = document.createElement("h2");
+  title.className = "about-title";
+  title.textContent = "Clawd on Desk";
+
+  const tagline = document.createElement("p");
+  tagline.className = "about-tagline";
+  tagline.textContent = t("aboutTagline");
+
+  hero.appendChild(crabWrap);
+  hero.appendChild(title);
+  hero.appendChild(tagline);
+  parent.appendChild(hero);
+
+  // Unified info section — version, repo, license, author, contributors
+  // all share the same visual block (no extra section-gap between author
+  // and contributors like an earlier draft that split them apart).
+  const infoSection = document.createElement("section");
+  infoSection.className = "section";
+  parent.appendChild(infoSection);
+
+  // Contributors header as an info-row (label + toggle button); list
+  // appended right after, no visual gap before it.
+  const contribRow = document.createElement("div");
+  contribRow.className = "about-info-row";
+  const contribLabel = document.createElement("div");
+  contribLabel.className = "about-info-label";
+  contribLabel.textContent = t("aboutContributorsLabel") + " (" + CONTRIBUTORS.length + ")";
+  const toggleBtn = document.createElement("button");
+  toggleBtn.className = "about-contributors-toggle";
+  toggleBtn.textContent = aboutContributorsExpanded ? t("aboutContributorsHide") : t("aboutContributorsShowAll");
+  contribRow.appendChild(contribLabel);
+  contribRow.appendChild(toggleBtn);
+
+  const contribList = document.createElement("div");
+  contribList.className = "about-contributors-list" + (aboutContributorsExpanded ? "" : " collapsed");
+  for (const name of CONTRIBUTORS) {
+    const link = document.createElement("a");
+    link.className = "about-contributor-link";
+    link.textContent = "@" + name;
+    link.href = "#";
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      openExternalSafe("https://github.com/" + name);
+    });
+    contribList.appendChild(link);
+  }
+
+  toggleBtn.addEventListener("click", () => {
+    aboutContributorsExpanded = !aboutContributorsExpanded;
+    contribList.classList.toggle("collapsed", !aboutContributorsExpanded);
+    toggleBtn.textContent = aboutContributorsExpanded
+      ? t("aboutContributorsHide")
+      : t("aboutContributorsShowAll");
+  });
+
+  // Footer
+  const footer = document.createElement("div");
+  footer.className = "about-footer";
+  footer.textContent = t("aboutFooter");
+  parent.appendChild(footer);
+
+  // Async: populate hero SVG and info rows
+  fetchAboutInfo().then((info) => {
+    const safe = info || {};
+
+    if (safe.heroSvgContent) {
+      // Inline SVG so the renderer can reach #shake-slot for the click reaction.
+      // CSP blocks <object>/<iframe> under default-src 'none'.
+      crabWrap.innerHTML = safe.heroSvgContent;
+    }
+    crabWrap.addEventListener("click", () => handleAboutCrabClick(crabWrap));
+
+    infoSection.innerHTML = "";
+
+    // Version + Check for Updates
+    const versionRow = document.createElement("div");
+    versionRow.className = "about-info-row";
+    const vl = document.createElement("div");
+    vl.className = "about-info-label";
+    vl.textContent = t("aboutVersionLabel");
+    const vvWrap = document.createElement("div");
+    vvWrap.style.display = "flex";
+    vvWrap.style.alignItems = "center";
+    vvWrap.style.gap = "10px";
+    const vv = document.createElement("span");
+    vv.className = "about-info-value";
+    vv.textContent = "v" + (safe.version || "?");
+    const updateBtn = document.createElement("button");
+    updateBtn.className = "about-check-update-btn";
+    updateBtn.textContent = t("aboutCheckForUpdates");
+    updateBtn.addEventListener("click", () => {
+      if (!window.settingsAPI || typeof window.settingsAPI.checkForUpdates !== "function") return;
+      updateBtn.disabled = true;
+      window.settingsAPI.checkForUpdates()
+        .catch(() => {})
+        .finally(() => { updateBtn.disabled = false; });
+    });
+    vvWrap.appendChild(vv);
+    vvWrap.appendChild(updateBtn);
+    versionRow.appendChild(vl);
+    versionRow.appendChild(vvWrap);
+    infoSection.appendChild(versionRow);
+
+    // Repository
+    if (safe.repoUrl) {
+      infoSection.appendChild(buildAboutLinkRow(
+        t("aboutRepositoryLabel"),
+        safe.repoUrl,
+        safe.repoUrl.replace(/^https?:\/\//, "")
+      ));
+    }
+
+    // License + copyright
+    if (safe.license) {
+      const lRow = document.createElement("div");
+      lRow.className = "about-info-row";
+      const ll = document.createElement("div");
+      ll.className = "about-info-label";
+      ll.textContent = t("aboutLicenseLabel");
+      const lv = document.createElement("div");
+      lv.className = "about-info-value";
+      lv.textContent = safe.license + (safe.copyright ? " \u00b7 " + safe.copyright : "");
+      lRow.appendChild(ll);
+      lRow.appendChild(lv);
+      infoSection.appendChild(lRow);
+    }
+
+    // Author
+    if (safe.authorName) {
+      infoSection.appendChild(buildAboutLinkRow(
+        t("aboutAuthorLabel"),
+        safe.authorUrl,
+        safe.authorName
+      ));
+    }
+
+    // Contributors (header row + collapsible list) appended last so
+    // `about-info-row:last-child { border-bottom: none }` hits the
+    // contributor row cleanly. List is a sibling; its own visual padding
+    // handles spacing when expanded.
+    infoSection.appendChild(contribRow);
+    infoSection.appendChild(contribList);
+  });
+}
+
 // ── Boot ──
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
@@ -1870,8 +3246,53 @@ window.settingsAPI.onChanged((payload) => {
   if (changes && "theme" in changes && themeList) {
     themeList = themeList.map((t) => ({ ...t, active: t.id === changes.theme }));
   }
+  if (tryPatchActiveTabInPlace(changes)) {
+    return;
+  }
   renderSidebar();
   renderContent();
+});
+
+if (window.settingsAPI && typeof window.settingsAPI.getShortcutFailures === "function") {
+  window.settingsAPI.getShortcutFailures().then((failures) => {
+    shortcutFailures = failures || {};
+    if (!shortcutFailureToastShown && Object.keys(shortcutFailures).length > 0) {
+      shortcutFailureToastShown = true;
+      showToast(t("shortcutErrorRegistrationFailed"), { error: true });
+    }
+    if (activeTab === "shortcuts") renderContent();
+  }).catch((err) => {
+    console.warn("settings: getShortcutFailures failed", err);
+  });
+}
+
+if (window.settingsAPI && typeof window.settingsAPI.onShortcutFailuresChanged === "function") {
+  window.settingsAPI.onShortcutFailuresChanged((failures) => {
+    shortcutFailures = failures || {};
+    if (!shortcutFailureToastShown && Object.keys(shortcutFailures).length > 0) {
+      shortcutFailureToastShown = true;
+      showToast(t("shortcutErrorRegistrationFailed"), { error: true });
+    }
+    if (activeTab === "shortcuts") renderContent();
+  });
+}
+
+if (window.settingsAPI && typeof window.settingsAPI.onShortcutRecordKey === "function") {
+  window.settingsAPI.onShortcutRecordKey((payload) => handleShortcutRecordKey(payload));
+}
+
+window.addEventListener("blur", () => {
+  if (shortcutRecordingActionId) cancelShortcutRecording();
+});
+
+document.addEventListener("mousedown", (event) => {
+  if (!shortcutRecordingActionId) return;
+  const target = event.target;
+  const row = target && typeof target.closest === "function"
+    ? target.closest("[data-shortcut-action-id]")
+    : null;
+  if (row && row.dataset.shortcutActionId === shortcutRecordingActionId) return;
+  cancelShortcutRecording();
 });
 
 window.settingsAPI.getSnapshot().then((snap) => {

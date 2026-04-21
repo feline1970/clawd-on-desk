@@ -11,6 +11,19 @@
 // so setBounds() calls stay valid until the display topology stabilizes.
 const SYNTHETIC_WORK_AREA = { x: 0, y: 0, width: 1920, height: 1080 };
 
+function getDisplayInsets(display) {
+  if (!display || !display.bounds || !display.workArea) {
+    return { top: 0, right: 0, bottom: 0, left: 0 };
+  }
+  const { bounds, workArea } = display;
+  return {
+    top: Math.max(0, workArea.y - bounds.y),
+    left: Math.max(0, workArea.x - bounds.x),
+    bottom: Math.max(0, bounds.y + bounds.height - (workArea.y + workArea.height)),
+    right: Math.max(0, bounds.x + bounds.width - (workArea.x + workArea.width)),
+  };
+}
+
 function findNearestWorkArea(displays, primaryWa, cx, cy) {
   if (!Array.isArray(displays) || displays.length === 0) {
     return primaryWa || SYNTHETIC_WORK_AREA;
@@ -27,7 +40,7 @@ function findNearestWorkArea(displays, primaryWa, cx, cy) {
   return nearest;
 }
 
-function computeLooseClamp(displays, primaryWa, x, y, w, h) {
+function computeLooseClamp(displays, primaryWa, x, y, w, h, options = {}) {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   if (Array.isArray(displays)) {
     for (const d of displays) {
@@ -48,14 +61,17 @@ function computeLooseClamp(displays, primaryWa, x, y, w, h) {
     maxX = wa.x + wa.width;
     maxY = wa.y + wa.height;
   }
-  const margin = Math.round(w * 0.25);
+  const marginX = options.marginX != null ? options.marginX : Math.round(w * 0.25);
+  const marginTop = options.marginTop != null ? options.marginTop : Math.round(h * 0.25);
+  const marginBottom = options.marginBottom != null ? options.marginBottom : Math.round(h * 0.25);
   return {
-    x: Math.max(minX - margin, Math.min(x, maxX - w + margin)),
-    y: Math.max(minY - margin, Math.min(y, maxY - h + margin)),
+    x: Math.max(minX - marginX, Math.min(x, maxX - w + marginX)),
+    y: Math.max(minY - marginTop, Math.min(y, maxY - h + marginBottom)),
   };
 }
 
 module.exports = {
+  getDisplayInsets,
   findNearestWorkArea,
   computeLooseClamp,
   SYNTHETIC_WORK_AREA,

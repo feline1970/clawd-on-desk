@@ -18,6 +18,8 @@
 
 const fs = require("fs");
 const path = require("path");
+const { isPlainObject } = require("./theme-loader");
+const { normalizeShortcuts, getDefaultShortcuts } = require("./shortcut-actions");
 
 const CURRENT_VERSION = 1;
 
@@ -33,9 +35,15 @@ const SCHEMA = {
   x: { type: "number", default: 0, validate: (v) => Number.isFinite(v) },
   y: { type: "number", default: 0, validate: (v) => Number.isFinite(v) },
   positionSaved: { type: "boolean", default: false },
+  positionThemeId: { type: "string", default: "" },
+  positionVariantId: { type: "string", default: "" },
+  // Last realized pixel bounds. Used to restore proportional mode exactly
+  // when keepSizeAcrossDisplays is enabled.
+  savedPixelWidth: { type: "number", default: 0, validate: (v) => Number.isFinite(v) && v >= 0 },
+  savedPixelHeight: { type: "number", default: 0, validate: (v) => Number.isFinite(v) && v >= 0 },
   size: {
     type: "string",
-    default: "P:10",
+    default: "P:9",
     // Accept "S"/"M"/"L" (legacy) or "P:<num>" — full migration happens elsewhere.
     validate: (v) =>
       typeof v === "string" &&
@@ -64,6 +72,16 @@ const SCHEMA = {
   showSessionId: { type: "boolean", default: false },
   mobileNotificationsEnabled: { type: "boolean", default: true },
   soundMuted: { type: "boolean", default: false },
+  allowEdgePinning: { type: "boolean", default: false },
+  // When true, moving the pet between displays does not trigger a
+  // proportional pixel-size recomputation. The pet keeps its current
+  // window size; the size slider still works (per-display proportional).
+  keepSizeAcrossDisplays: { type: "boolean", default: false },
+  shortcuts: {
+    type: "object",
+    defaultFactory: () => getDefaultShortcuts(),
+    normalize: normalizeShortcuts,
+  },
   // Theme
   theme: { type: "string", default: "clawd" },
   // Phase 2/3 placeholders — schema reserves the keys so future migrations don't need v2.
@@ -195,10 +213,6 @@ function normalizeAgents(value, defaultsValue) {
   return out;
 }
 
-function isPlainObject(value) {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
 function normalizeTransitionOverride(value) {
   if (!isPlainObject(value)) return null;
   const out = {};
@@ -213,8 +227,47 @@ function normalizeSlotOverride(entry, { allowDisabled = true } = {}) {
   if (allowDisabled && entry.disabled === true) out.disabled = true;
   if (typeof entry.file === "string" && entry.file) out.file = entry.file;
   if (typeof entry.sourceThemeId === "string" && entry.sourceThemeId) out.sourceThemeId = entry.sourceThemeId;
+  if (typeof entry.durationMs === "number" && Number.isFinite(entry.durationMs)) out.durationMs = entry.durationMs;
   const transition = normalizeTransitionOverride(entry.transition);
   if (transition) out.transition = transition;
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+const REACTION_KEYS = new Set(["drag", "clickLeft", "clickRight", "annoyed", "double"]);
+
+// Per-file hitbox override: { file.svg: boolean }.
+// true  = force the file INTO the wide-hitbox set (even if the theme author didn't list it)
+// false = force the file OUT of the wide-hitbox set (even if the theme author did list it)
+// absent = follow whatever the theme declares
+function normalizeHitboxOverrides(value) {
+  if (!isPlainObject(value)) return null;
+  const out = {};
+  if (isPlainObject(value.wide)) {
+    const wide = {};
+    for (const [file, enabled] of Object.entries(value.wide)) {
+      if (typeof file !== "string" || !file) continue;
+      if (typeof enabled !== "boolean") continue;
+      wide[file] = enabled;
+    }
+    if (Object.keys(wide).length > 0) out.wide = wide;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function normalizeReactionOverridesMap(value) {
+  if (!isPlainObject(value)) return null;
+  const out = {};
+  for (const [reactionKey, entry] of Object.entries(value)) {
+    if (!REACTION_KEYS.has(reactionKey)) continue;
+    const cleanEntry = normalizeSlotOverride(entry, { allowDisabled: false });
+    if (!cleanEntry) continue;
+    // drag has no duration semantically (it plays until pointer-up), so strip
+    // any durationMs written by a wayward import.
+    if (reactionKey === "drag" && Object.prototype.hasOwnProperty.call(cleanEntry, "durationMs")) {
+      delete cleanEntry.durationMs;
+    }
+    if (Object.keys(cleanEntry).length > 0) out[reactionKey] = cleanEntry;
+  }
   return Object.keys(out).length > 0 ? out : null;
 }
 
@@ -229,7 +282,7 @@ function normalizeStateOverridesMap(value) {
   return Object.keys(out).length > 0 ? out : null;
 }
 
-function normalizeTierOverrideGroup(value) {
+function normalizeFileKeyedOverrideMap(value) {
   if (!isPlainObject(value)) return null;
   const out = {};
   for (const [originalFile, entry] of Object.entries(value)) {
@@ -262,7 +315,7 @@ function normalizeThemeOverrides(value, defaultsValue) {
     // Back-compat: older prefs wrote state entries directly under themeId.
     const legacyStates = {};
     for (const [key, entry] of Object.entries(themeMap)) {
-      if (key === "states" || key === "tiers" || key === "timings") continue;
+      if (key === "states" || key === "tiers" || key === "timings" || key === "idleAnimations" || key === "reactions" || key === "hitbox") continue;
       const cleanEntry = normalizeSlotOverride(entry, { allowDisabled: true });
       if (cleanEntry) legacyStates[key] = cleanEntry;
     }
@@ -274,8 +327,8 @@ function normalizeThemeOverrides(value, defaultsValue) {
     const tierGroups = isPlainObject(themeMap.tiers) ? themeMap.tiers : null;
     const cleanTiers = {};
     if (tierGroups) {
-      const working = normalizeTierOverrideGroup(tierGroups.workingTiers);
-      const juggling = normalizeTierOverrideGroup(tierGroups.jugglingTiers);
+      const working = normalizeFileKeyedOverrideMap(tierGroups.workingTiers);
+      const juggling = normalizeFileKeyedOverrideMap(tierGroups.jugglingTiers);
       if (working) cleanTiers.workingTiers = working;
       if (juggling) cleanTiers.jugglingTiers = juggling;
     }
@@ -288,6 +341,15 @@ function normalizeThemeOverrides(value, defaultsValue) {
         cleanThemeMap.timings = { autoReturn: cleanAutoReturn };
       }
     }
+
+    const idleAnimations = normalizeFileKeyedOverrideMap(themeMap.idleAnimations);
+    if (idleAnimations) cleanThemeMap.idleAnimations = idleAnimations;
+
+    const reactions = normalizeReactionOverridesMap(themeMap.reactions);
+    if (reactions) cleanThemeMap.reactions = reactions;
+
+    const hitbox = normalizeHitboxOverrides(themeMap.hitbox);
+    if (hitbox) cleanThemeMap.hitbox = hitbox;
 
     if (Object.keys(cleanThemeMap).length > 0) {
       out[themeId] = cleanThemeMap;
@@ -370,4 +432,6 @@ module.exports = {
   migrate,
   load,
   save,
+  normalizeThemeOverrides,
+  normalizeShortcuts,
 };

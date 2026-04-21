@@ -26,6 +26,8 @@ class CodexLogMonitor {
     this._recentDayDirsCache = [];
     this._recentDayDirsCacheAt = 0;
     this._recentDayDirsDateKey = "";
+    this._activeDayDirsCache = null;
+    this._activeDayDirsCacheAt = 0;
     this._startedAtMs = Date.now();
   }
 
@@ -105,7 +107,70 @@ class CodexLogMonitor {
     // Fallback: include most recent existing day dirs to handle
     // clock/timezone drift and `codex resume` of older sessions
     for (const dir of this._getCachedRecentExistingDayDirs(7)) addDir(dir);
+    // Also include any day dir that has a recently-modified rollout file.
+    // Covers Codex desktop app's long-lived conversations where new writes
+    // keep landing in the ORIGINAL day dir (which can be weeks/months old).
+    for (const dir of this._getActiveDayDirs()) addDir(dir);
     return dirs;
+  }
+
+  // Scan baseDir for any day dir containing a rollout-*.jsonl whose mtime
+  // is within `withinMs`. Returns the set of such day dirs.
+  // Cached for 5s to keep polling cheap.
+  _getActiveDayDirs(withinMs = 5 * 60 * 1000) {
+    const now = Date.now();
+    if (this._activeDayDirsCache && now - this._activeDayDirsCacheAt < 5000) {
+      return this._activeDayDirsCache;
+    }
+    const out = new Set();
+    let years;
+    try {
+      years = fs.readdirSync(this._baseDir, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && /^\d{4}$/.test(d.name))
+        .map((d) => d.name);
+    } catch {
+      this._activeDayDirsCache = [];
+      this._activeDayDirsCacheAt = now;
+      return [];
+    }
+    for (const y of years) {
+      const yPath = path.join(this._baseDir, y);
+      let months;
+      try {
+        months = fs.readdirSync(yPath, { withFileTypes: true })
+          .filter((d) => d.isDirectory() && /^\d{2}$/.test(d.name))
+          .map((d) => d.name);
+      } catch { continue; }
+      for (const m of months) {
+        const mPath = path.join(yPath, m);
+        let days;
+        try {
+          days = fs.readdirSync(mPath, { withFileTypes: true })
+            .filter((d) => d.isDirectory() && /^\d{2}$/.test(d.name))
+            .map((d) => d.name);
+        } catch { continue; }
+        for (const day of days) {
+          const dPath = path.join(mPath, day);
+          let files;
+          try {
+            files = fs.readdirSync(dPath);
+          } catch { continue; }
+          for (const file of files) {
+            if (!file.startsWith("rollout-") || !file.endsWith(".jsonl")) continue;
+            try {
+              const mtime = fs.statSync(path.join(dPath, file)).mtimeMs;
+              if (now - mtime < withinMs) {
+                out.add(dPath);
+                break;
+              }
+            } catch {}
+          }
+        }
+      }
+    }
+    this._activeDayDirsCache = Array.from(out);
+    this._activeDayDirsCacheAt = now;
+    return this._activeDayDirsCache;
   }
 
   _getCachedRecentExistingDayDirs(limit = 7) {
@@ -191,6 +256,7 @@ class CodexLogMonitor {
         sessionId: "codex:" + sessionId,
         filePath,
         cwd: "",
+        sessionTitle: null,
         lastEventTime: Date.now(),
         lastState: null,
         partial: "",
@@ -260,6 +326,15 @@ class CodexLogMonitor {
       tracked.cwd = payload.cwd || "";
     }
 
+    // Extract Codex-authored session summary (turn_context.summary).
+    // Updates tracked.sessionTitle in place; gets picked up by the next
+    // _onStateChange call. Intentionally no metaOnly side-channel —
+    // accepts brief staleness until the next state emit.
+    const extractedTitle = this._extractSessionTitle(obj);
+    if (extractedTitle && extractedTitle !== tracked.sessionTitle) {
+      tracked.sessionTitle = extractedTitle;
+    }
+
     // Approval heuristic: exec_command_end or function_call_output means command finished —
     // clear pending approval timer (these events are not in logEventMap)
     if (key === "event_msg:exec_command_end" || key === "response_item:function_call_output") {
@@ -298,6 +373,7 @@ class CodexLogMonitor {
         cwd: tracked.cwd,
         sourcePid: agentPid,
         agentPid,
+        sessionTitle: tracked.sessionTitle,
       });
       return;
     }
@@ -316,6 +392,7 @@ class CodexLogMonitor {
             cwd: tracked.cwd,
             sourcePid: agentPid,
             agentPid,
+            sessionTitle: tracked.sessionTitle,
             permissionDetail: { command: cmd, rawPayload: payload },
           });
           return;
@@ -328,6 +405,7 @@ class CodexLogMonitor {
             cwd: tracked.cwd,
             sourcePid: agentPid,
             agentPid,
+            sessionTitle: tracked.sessionTitle,
             permissionDetail: { command: cmd, rawPayload: payload },
           });
         }, APPROVAL_HEURISTIC_MS);
@@ -344,7 +422,22 @@ class CodexLogMonitor {
       cwd: tracked.cwd,
       sourcePid: agentPid,
       agentPid,
+      sessionTitle: tracked.sessionTitle,
     });
+  }
+
+  // Codex-authored session summary, extracted from turn_context.summary.
+  // Filters "none" / "auto" placeholder values that Codex writes when
+  // the model hasn't produced a real summary yet.
+  _extractSessionTitle(obj) {
+    if (!obj || typeof obj !== "object") return null;
+    const payload = obj.payload && typeof obj.payload === "object" ? obj.payload : null;
+    if (!payload) return null;
+    if (obj.type === "turn_context" && typeof payload.summary === "string") {
+      const summary = payload.summary.trim();
+      if (summary && summary !== "none" && summary !== "auto") return summary;
+    }
+    return null;
   }
 
   // Extract shell command from function_call payload
@@ -448,6 +541,7 @@ class CodexLogMonitor {
           cwd: tracked.cwd,
           sourcePid: tracked.agentPid,
           agentPid: tracked.agentPid,
+          sessionTitle: tracked.sessionTitle,
         });
         this._tracked.delete(filePath);
       }

@@ -2,6 +2,7 @@
 // Extracted from main.js L349-357, L1594-1746
 
 const { BrowserWindow, globalShortcut } = require("electron");
+const { getDefaultShortcuts } = require("./shortcut-actions");
 const path = require("path");
 const http = require("http");
 const {
@@ -204,10 +205,37 @@ const PASSTHROUGH_TOOLS = new Set([
   "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskStop", "TaskOutput",
 ]);
 
-// ── Permission hotkeys (Ctrl+Shift+Y = Allow, Ctrl+Shift+N = Deny) ──
-const HOTKEY_ALLOW = "CommandOrControl+Shift+Y";
-const HOTKEY_DENY  = "CommandOrControl+Shift+N";
-let hotkeysRegistered = false;
+// ── Permission hotkeys (contextual global shortcuts) ──
+let registeredAllowAccel = null;
+let registeredDenyAccel = null;
+
+function getShortcutSnapshot() {
+  const defaults = getDefaultShortcuts();
+  const settingsSnapshot = typeof ctx.getSettingsSnapshot === "function"
+    ? ctx.getSettingsSnapshot()
+    : null;
+  const shortcuts = settingsSnapshot && settingsSnapshot.shortcuts;
+  return {
+    ...defaults,
+    ...(shortcuts && typeof shortcuts === "object" ? shortcuts : {}),
+  };
+}
+
+function verifyUnregister(accelerator) {
+  try {
+    globalShortcut.unregister(accelerator);
+  } catch {
+    return false;
+  }
+  if (typeof globalShortcut.isRegistered === "function") {
+    try {
+      return !globalShortcut.isRegistered(accelerator);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
 
 function getActionablePermissions() {
   return pendingPermissions.filter(
@@ -215,21 +243,57 @@ function getActionablePermissions() {
   );
 }
 
+function syncSingle(actionId, current, target, handler, setState) {
+  if (current === target) {
+    if (typeof ctx.clearShortcutFailure === "function") {
+      ctx.clearShortcutFailure(actionId);
+    }
+    return;
+  }
+
+  if (target !== null) {
+    let ok = false;
+    try { ok = !!globalShortcut.register(target, handler); } catch { ok = false; }
+    if (!ok) {
+      if (typeof ctx.reportShortcutFailure === "function") {
+        ctx.reportShortcutFailure(actionId, "system conflict");
+      }
+      return;
+    }
+  }
+
+  if (current !== null) {
+    const unregistered = verifyUnregister(current);
+    if (!unregistered) {
+      if (target !== null) {
+        try { globalShortcut.unregister(target); } catch {}
+      }
+      if (typeof ctx.reportShortcutFailure === "function") {
+        ctx.reportShortcutFailure(actionId, "switch failed");
+      }
+      return;
+    }
+  }
+
+  setState(target);
+  if (typeof ctx.clearShortcutFailure === "function") {
+    ctx.clearShortcutFailure(actionId);
+  }
+}
+
 function syncPermissionShortcuts() {
+  const shortcutSnapshot = getShortcutSnapshot();
   const shouldRegister = !ctx.hideBubbles && !ctx.petHidden
     && getActionablePermissions().length > 0;
+  const targetAllow = shouldRegister ? shortcutSnapshot.permissionAllow : null;
+  const targetDeny = shouldRegister ? shortcutSnapshot.permissionDeny : null;
 
-  if (shouldRegister && !hotkeysRegistered) {
-    try {
-      const okAllow = globalShortcut.register(HOTKEY_ALLOW, hotkeyAllow);
-      const okDeny  = globalShortcut.register(HOTKEY_DENY,  hotkeyDeny);
-      hotkeysRegistered = okAllow || okDeny;
-    } catch {}
-  } else if (!shouldRegister && hotkeysRegistered) {
-    try { globalShortcut.unregister(HOTKEY_ALLOW); } catch {}
-    try { globalShortcut.unregister(HOTKEY_DENY);  } catch {}
-    hotkeysRegistered = false;
-  }
+  syncSingle("permissionAllow", registeredAllowAccel, targetAllow, hotkeyAllow, (value) => {
+    registeredAllowAccel = value;
+  });
+  syncSingle("permissionDeny", registeredDenyAccel, targetDeny, hotkeyDeny, (value) => {
+    registeredDenyAccel = value;
+  });
 }
 
 function hotkeyResolve(behavior, message) {
@@ -251,6 +315,10 @@ function hotkeyResolve(behavior, message) {
 function hotkeyAllow() { hotkeyResolve("allow"); }
 function hotkeyDeny()  { hotkeyResolve("deny", "Denied via hotkey"); }
 
+const unsubscribeShortcuts = typeof ctx.subscribeShortcuts === "function"
+  ? ctx.subscribeShortcuts(() => syncPermissionShortcuts())
+  : null;
+
 // Fallback height before renderer reports actual measurement
 function estimateBubbleHeight(sugCount) {
   return 200 + (sugCount || 0) * 37;
@@ -263,7 +331,7 @@ function repositionBubbles() {
   const margin = 8;
   const gap = 6;
   const bw = 340;
-  const petBounds = ctx.win.getBounds();
+  const petBounds = ctx.getPetWindowBounds();
   const cx = petBounds.x + petBounds.width / 2;
   const cy = petBounds.y + petBounds.height / 2;
   const wa = ctx.getNearestWorkArea(cx, cy);
@@ -463,7 +531,7 @@ function permLog(msg) {
 // Fire-and-forget POST to the opencode plugin's reverse bridge. The plugin
 // runs inside opencode's Bun process and does NOT expose opencode's own
 // permission route externally — TUI mode has no TCP listener at all (see
-// Phase 2 Spike in docs/plan-opencode-integration.md). Instead the plugin
+// Phase 2 Spike in docs/plans/plan-opencode-integration.md). Instead the plugin
 // starts its own Bun.serve on a random localhost port and forwards our
 // decision to opencode's in-process Hono router via ctx.client._client.post().
 //
@@ -704,10 +772,16 @@ function clearCodexNotifyBubbles(sessionId) {
 
 function cleanup() {
   // Unregister hotkeys
-  if (hotkeysRegistered) {
-    try { globalShortcut.unregister(HOTKEY_ALLOW); } catch {}
-    try { globalShortcut.unregister(HOTKEY_DENY);  } catch {}
-    hotkeysRegistered = false;
+  if (registeredAllowAccel !== null) {
+    try { globalShortcut.unregister(registeredAllowAccel); } catch {}
+    registeredAllowAccel = null;
+  }
+  if (registeredDenyAccel !== null) {
+    try { globalShortcut.unregister(registeredDenyAccel); } catch {}
+    registeredDenyAccel = null;
+  }
+  if (typeof unsubscribeShortcuts === "function") {
+    try { unsubscribeShortcuts(); } catch {}
   }
   // Clean up all pending permission requests — send explicit deny so Claude Code doesn't hang
   for (const perm of [...pendingPermissions]) {

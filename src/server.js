@@ -30,6 +30,99 @@ function shouldBypassOpencodeBubble(ctx) {
   return !ctx.isAgentPermissionsEnabled("opencode");
 }
 
+// Truncate large string values in objects (recursive) — bubble only needs a preview
+const PREVIEW_MAX = 500;
+const MAX_PERMISSION_SUGGESTIONS = 20;
+const MAX_ELICITATION_QUESTIONS = 5;
+const MAX_ELICITATION_OPTIONS = 5;
+const MAX_ELICITATION_HEADER = 48;
+const MAX_ELICITATION_PROMPT = 240;
+const MAX_ELICITATION_OPTION_LABEL = 80;
+const MAX_ELICITATION_OPTION_DESCRIPTION = 160;
+
+function truncateDeep(obj, depth) {
+  if ((depth || 0) > 10) return obj;
+  if (Array.isArray(obj)) return obj.map(v => truncateDeep(v, (depth || 0) + 1));
+  if (obj && typeof obj === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) out[k] = truncateDeep(v, (depth || 0) + 1);
+    return out;
+  }
+  return typeof obj === "string" && obj.length > PREVIEW_MAX
+    ? obj.slice(0, PREVIEW_MAX) + "\u2026" : obj;
+}
+
+function clampPreviewText(value, max) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return trimmed.length > max ? `${trimmed.slice(0, Math.max(0, max - 1))}\u2026` : trimmed;
+}
+
+function normalizePermissionSuggestions(rawSuggestions) {
+  const suggestions = Array.isArray(rawSuggestions)
+    ? rawSuggestions.filter((entry) => entry && typeof entry === "object")
+    : [];
+  const addRulesItems = suggestions.filter((entry) => entry.type === "addRules");
+  const nonAddRules = suggestions.filter((entry) => entry.type !== "addRules");
+  const mergedAddRules = addRulesItems.length > 1
+    ? {
+        type: "addRules",
+        destination: addRulesItems[0].destination || "localSettings",
+        behavior: addRulesItems[0].behavior || "allow",
+        rules: addRulesItems.flatMap((entry) => (
+          Array.isArray(entry.rules) ? entry.rules : [{ toolName: entry.toolName, ruleContent: entry.ruleContent }]
+        )),
+      }
+    : addRulesItems[0] || null;
+
+  if (!mergedAddRules) return nonAddRules.slice(0, MAX_PERMISSION_SUGGESTIONS);
+  if (nonAddRules.length + 1 <= MAX_PERMISSION_SUGGESTIONS) return [...nonAddRules, mergedAddRules];
+  return [
+    ...nonAddRules.slice(0, MAX_PERMISSION_SUGGESTIONS - 1),
+    mergedAddRules,
+  ];
+}
+
+function normalizeElicitationToolInput(toolInput) {
+  if (!toolInput || typeof toolInput !== "object") return toolInput;
+  if (!Array.isArray(toolInput.questions)) return toolInput;
+
+  const questions = toolInput.questions
+    .slice(0, MAX_ELICITATION_QUESTIONS)
+    .map((question) => {
+      if (!question || typeof question !== "object") return null;
+      const options = Array.isArray(question.options)
+        ? question.options
+          .slice(0, MAX_ELICITATION_OPTIONS)
+          .map((option) => {
+            if (!option || typeof option !== "object") return null;
+            return {
+              ...option,
+              label: clampPreviewText(option.label, MAX_ELICITATION_OPTION_LABEL),
+              description: clampPreviewText(option.description, MAX_ELICITATION_OPTION_DESCRIPTION),
+            };
+          })
+          .filter(Boolean)
+        : [];
+
+      const normalized = {
+        ...question,
+        header: clampPreviewText(question.header, MAX_ELICITATION_HEADER),
+        question: clampPreviewText(question.question, MAX_ELICITATION_PROMPT),
+        options,
+      };
+      if (!normalized.question) return null;
+      return normalized;
+    })
+    .filter(Boolean);
+
+  return {
+    ...toolInput,
+    questions,
+  };
+}
+
 module.exports = function initServer(ctx) {
 
 const fsApi = ctx.fs || fs;
@@ -169,20 +262,6 @@ function sendStateHealthResponse(res) {
   res.end(body);
 }
 
-// Truncate large string values in objects (recursive) — bubble only needs a preview
-const PREVIEW_MAX = 500;
-function truncateDeep(obj, depth) {
-  if ((depth || 0) > 10) return obj;
-  if (Array.isArray(obj)) return obj.map(v => truncateDeep(v, (depth || 0) + 1));
-  if (obj && typeof obj === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(obj)) out[k] = truncateDeep(v, (depth || 0) + 1);
-    return out;
-  }
-  return typeof obj === "string" && obj.length > PREVIEW_MAX
-    ? obj.slice(0, PREVIEW_MAX) + "\u2026" : obj;
-}
-
 const HOOK_MARKER = "clawd-hook.js";
 const SETTINGS_FILENAME = "settings.json";
 // Watch ~/.claude/ directory for settings.json overwrites (e.g. CC-Switch)
@@ -236,6 +315,11 @@ function startClaudeSettingsWatcher() {
   }
 }
 
+// /state POST body size cap. Raised from 1024 to 4096 to give new fields
+// (session_title) headroom on top of cwd / pid_chain / host / etc. Still a
+// local-only 127.0.0.1 endpoint — not an Internet DoS concern.
+const MAX_STATE_BODY_BYTES = 4096;
+
 function startHttpServer() {
   httpServer = createHttpServer((req, res) => {
     if (req.method === "GET" && req.url === "/state") {
@@ -247,7 +331,7 @@ function startHttpServer() {
       req.on("data", (chunk) => {
         if (tooLarge) return;
         bodySize += chunk.length;
-        if (bodySize > 1024) { tooLarge = true; return; }
+        if (bodySize > MAX_STATE_BODY_BYTES) { tooLarge = true; return; }
         body += chunk;
       });
       req.on("end", () => {
@@ -272,6 +356,11 @@ function startHttpServer() {
           const agentId = typeof data.agent_id === "string" ? data.agent_id : "claude-code";
           const host = typeof data.host === "string" ? data.host : null;
           const headless = data.headless === true;
+          // Session title (Claude Code /rename or Codex turn_context.summary).
+          // Non-string / empty values are silently dropped — matches the
+          // "ignore + fall back" pattern used by cwd / agent_id above.
+          const rawTitle = typeof data.session_title === "string" ? data.session_title.trim() : "";
+          const sessionTitle = rawTitle || null;
           // Agent gate: user disabled this agent in the settings panel. Drop
           // with 204 so hook scripts get a quick no-op response instead of
           // hanging on our HTTP connection. Still surfaces as a success code
@@ -299,7 +388,18 @@ function startHttpServer() {
               const safeSvg = path.basename(svg);
               ctx.setState(state, safeSvg);
             } else {
-              ctx.updateSession(sid, state, event, source_pid, cwd, editor, pidChain, agentPid, agentId, host, headless, display_svg);
+              ctx.updateSession(sid, state, event, {
+                sourcePid: source_pid,
+                cwd,
+                editor,
+                pidChain,
+                agentPid,
+                agentId,
+                host,
+                headless,
+                displayHint: display_svg,
+                sessionTitle,
+              });
             }
             res.writeHead(200, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
             res.end("ok");
@@ -423,6 +523,12 @@ function startHttpServer() {
               opencodePatterns: patterns,
             };
             ctx.pendingPermissions.push(permEntry);
+            // Play notification animation on the pet body so the bubble doesn't
+            // appear "silently". Mirrors the Codex path (main.js showCodexNotifyBubble)
+            // and the Elicitation branch below. state.js:581 has a special
+            // PermissionRequest branch that setStates notification without
+            // mutating session state — so working/thinking is preserved for resolve.
+            ctx.updateSession(sessionId, "notification", "PermissionRequest", { agentId: "opencode" });
             ctx.permLog(`opencode showing bubble: tool=${toolName} session=${sessionId}`);
             try {
               ctx.showPermissionBubble(permEntry);
@@ -476,21 +582,7 @@ function startHttpServer() {
           // disables an agent mid-flight.
           const permAgentId = typeof data.agent_id === "string" && data.agent_id ? data.agent_id : "claude-code";
           const rawSuggestions = Array.isArray(data.permission_suggestions) ? data.permission_suggestions : [];
-          // Merge multiple addRules suggestions (e.g. piped commands) into one button
-          const addRulesItems = rawSuggestions.filter(s => s && s.type === "addRules");
-          const suggestions = addRulesItems.length > 1
-            ? [
-                ...rawSuggestions.filter(s => s && s.type !== "addRules"),
-                {
-                  type: "addRules",
-                  destination: addRulesItems[0].destination || "localSettings", // CC sends uniform destination per request
-                  behavior: addRulesItems[0].behavior || "allow",
-                  rules: addRulesItems.flatMap(s =>
-                    Array.isArray(s.rules) ? s.rules : [{ toolName: s.toolName, ruleContent: s.ruleContent }]
-                  ),
-                },
-              ]
-            : rawSuggestions;
+          const suggestions = normalizePermissionSuggestions(rawSuggestions);
 
           const existingSession = ctx.sessions.get(sessionId);
           if (existingSession && existingSession.headless) {
@@ -514,10 +606,11 @@ function startHttpServer() {
           // Elicitation (AskUserQuestion) — show notification bubble, not permission bubble.
           // User clicks "Go to Terminal" → deny → Claude Code falls back to terminal.
           if (toolName === "AskUserQuestion") {
+            const elicitationInput = normalizeElicitationToolInput(toolInput);
             ctx.permLog(`ELICITATION: tool=${toolName} session=${sessionId}`);
-            ctx.updateSession(sessionId, "notification", "Elicitation", null, "", null, null, null, "claude-code");
+            ctx.updateSession(sessionId, "notification", "Elicitation", { agentId: "claude-code" });
 
-            const permEntry = { res, abortHandler: null, suggestions: [], sessionId, bubble: null, hideTimer: null, toolName, toolInput, resolvedSuggestion: null, createdAt: Date.now(), isElicitation: true, agentId: permAgentId };
+            const permEntry = { res, abortHandler: null, suggestions: [], sessionId, bubble: null, hideTimer: null, toolName, toolInput: elicitationInput, resolvedSuggestion: null, createdAt: Date.now(), isElicitation: true, agentId: permAgentId };
             const abortHandler = () => {
               if (res.writableFinished) return;
               ctx.permLog("abortHandler fired (elicitation)");
@@ -540,6 +633,13 @@ function startHttpServer() {
           res.on("close", abortHandler);
 
           ctx.pendingPermissions.push(permEntry);
+
+          // Play notification animation on the pet body so the bubble doesn't
+          // appear "silently". Mirrors the Codex path (main.js showCodexNotifyBubble)
+          // and the Elicitation branch above. state.js:581 has a special
+          // PermissionRequest branch that setStates notification without
+          // mutating session state — so working/thinking is preserved for resolve.
+          ctx.updateSession(sessionId, "notification", "PermissionRequest", { agentId: permAgentId });
 
           if (ctx.hideBubbles) {
             ctx.permLog(`bubble hidden: tool=${toolName} session=${sessionId} — terminal only`);
@@ -626,4 +726,9 @@ return {
 
 };
 
-module.exports.__test = { shouldBypassCCBubble, shouldBypassOpencodeBubble };
+module.exports.__test = {
+  shouldBypassCCBubble,
+  shouldBypassOpencodeBubble,
+  normalizePermissionSuggestions,
+  normalizeElicitationToolInput,
+};

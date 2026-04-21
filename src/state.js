@@ -5,6 +5,7 @@ let screen, nativeImage;
 try { ({ screen, nativeImage } = require("electron")); } catch { screen = null; nativeImage = null; }
 const path = require("path");
 const fs = require("fs");
+const { VISUAL_FALLBACK_STATES } = require("./theme-loader");
 
 // ── Agent icons (official logos from assets/icons/agents/) ──
 const AGENT_ICON_DIR = path.join(__dirname, "..", "assets", "icons", "agents");
@@ -29,6 +30,7 @@ const _kill = ctx.processKill || process.kill.bind(process);
 let theme = null;
 let SVG_IDLE_FOLLOW = null;
 let STATE_SVGS = {};
+let STATE_BINDINGS = {};
 let MIN_DISPLAY_MS = {};
 let AUTO_RETURN_MS = {};
 let DEEP_SLEEP_TIMEOUT = 0;
@@ -36,6 +38,7 @@ let YAWN_DURATION = 0;
 let WAKE_DURATION = 0;
 let DND_SKIP_YAWN = false;
 let COLLAPSE_DURATION = 0;
+let SLEEP_MODE = "full";
 const SLEEP_SEQUENCE = new Set(["yawning", "dozing", "collapsing", "sleeping", "waking"]);
 
 const STATE_PRIORITY = {
@@ -44,6 +47,42 @@ const STATE_PRIORITY = {
 };
 
 const ONESHOT_STATES = new Set(["attention", "error", "sweeping", "notification", "carrying"]);
+
+// Rolling event history per session. Used by deriveSessionBadge() to infer a
+// user-facing status ("Running" / "Done" / "Interrupted" / "Idle") without
+// extending the state machine. Cap avoids unbounded growth on long sessions.
+const RECENT_EVENT_LIMIT = 8;
+
+// Badge (4-category) → i18n key. Flat keys, not dot-paths — createTranslator()
+// in src/i18n.js only does flat dict[key] lookup.
+const SESSION_BADGE_KEYS = {
+  running: "sessionBadgeRunning",
+  done: "sessionBadgeDone",
+  interrupted: "sessionBadgeInterrupted",
+  idle: "sessionBadgeIdle",
+};
+
+// Hook event name → i18n key for recentEvents.label derivation (C2 renders at
+// read time so a language switch updates already-stored events too).
+// eslint-disable-next-line no-unused-vars
+const EVENT_LABEL_KEYS = {
+  SessionStart: "eventLabelSessionStart",
+  SessionEnd: "eventLabelSessionEnd",
+  UserPromptSubmit: "eventLabelUserPromptSubmit",
+  PreToolUse: "eventLabelPreToolUse",
+  PostToolUse: "eventLabelPostToolUse",
+  PostToolUseFailure: "eventLabelPostToolUseFailure",
+  Stop: "eventLabelStop",
+  StopFailure: "eventLabelStopFailure",
+  SubagentStart: "eventLabelSubagentStart",
+  SubagentStop: "eventLabelSubagentStop",
+  PreCompact: "eventLabelPreCompact",
+  PostCompact: "eventLabelPostCompact",
+  Notification: "eventLabelNotification",
+  Elicitation: "eventLabelElicitation",
+  WorktreeCreate: "eventLabelWorktreeCreate",
+  "stale-cleanup": "eventLabelStaleCleanup",
+};
 
 // Session display hints — validated against theme.displayHintMap keys
 let DISPLAY_HINT_MAP = {};
@@ -97,10 +136,43 @@ const STATE_LABEL_KEY = {
   idle: "sessionIdle", sleeping: "sessionSleeping",
 };
 
+function buildStateBindings(nextTheme) {
+  const bindings = {};
+  const sourceBindings = nextTheme && nextTheme._stateBindings;
+  if (sourceBindings && typeof sourceBindings === "object") {
+    for (const [stateKey, entry] of Object.entries(sourceBindings)) {
+      bindings[stateKey] = {
+        files: Array.isArray(entry && entry.files) ? [...entry.files] : [],
+        fallbackTo: typeof (entry && entry.fallbackTo) === "string" && entry.fallbackTo ? entry.fallbackTo : null,
+      };
+    }
+  }
+  if (nextTheme && nextTheme.states) {
+    for (const [stateKey, files] of Object.entries(nextTheme.states)) {
+      const normalizedFiles = Array.isArray(files) ? [...files] : [];
+      if (!bindings[stateKey]) {
+        bindings[stateKey] = { files: normalizedFiles, fallbackTo: null };
+      } else if (bindings[stateKey].files.length === 0) {
+        bindings[stateKey].files = normalizedFiles;
+      }
+    }
+  }
+  if (nextTheme && nextTheme.miniMode && nextTheme.miniMode.states) {
+    for (const [stateKey, files] of Object.entries(nextTheme.miniMode.states)) {
+      bindings[stateKey] = {
+        files: Array.isArray(files) ? [...files] : [],
+        fallbackTo: null,
+      };
+    }
+  }
+  return bindings;
+}
+
 function refreshTheme() {
   theme = ctx.theme;
   SVG_IDLE_FOLLOW = theme.states.idle[0];
   STATE_SVGS = { ...theme.states };
+  STATE_BINDINGS = buildStateBindings(theme);
   if (theme.miniMode && theme.miniMode.states) {
     Object.assign(STATE_SVGS, theme.miniMode.states);
   }
@@ -111,6 +183,7 @@ function refreshTheme() {
   WAKE_DURATION = theme.timings.wakeDuration;
   DND_SKIP_YAWN = !!theme.timings.dndSkipYawn;
   COLLAPSE_DURATION = theme.timings.collapseDuration || 0;
+  SLEEP_MODE = theme.sleepSequence && theme.sleepSequence.mode === "direct" ? "direct" : "full";
   DISPLAY_HINT_MAP = theme.displayHintMap || {};
   HIT_BOXES = theme.hitBoxes;
   WIDE_SVGS = new Set(theme.wideHitboxFiles || []);
@@ -179,6 +252,66 @@ function isOneshotDisabled(logicalState) {
   catch { return false; }
 }
 
+function pickStateFile(files) {
+  if (!Array.isArray(files) || files.length === 0) return null;
+  return files[Math.floor(Math.random() * files.length)];
+}
+
+function hasOwnVisualFiles(state) {
+  const entry = STATE_BINDINGS[state];
+  return !!(entry && Array.isArray(entry.files) && entry.files.length > 0);
+}
+
+function resolveVisualBinding(state) {
+  let cursor = state;
+  let visited = null;
+  for (let hops = 0; hops <= 3; hops += 1) {
+    const entry = STATE_BINDINGS[cursor];
+    if (entry && Array.isArray(entry.files) && entry.files.length > 0) {
+      return pickStateFile(entry.files);
+    }
+    if (!entry || !entry.fallbackTo || !VISUAL_FALLBACK_STATES.has(cursor)) break;
+    if (!visited) visited = new Set([cursor]);
+    if (visited.has(entry.fallbackTo)) break;
+    visited.add(entry.fallbackTo);
+    cursor = entry.fallbackTo;
+  }
+  const idleEntry = STATE_BINDINGS.idle;
+  if (idleEntry && Array.isArray(idleEntry.files) && idleEntry.files.length > 0) {
+    return pickStateFile(idleEntry.files);
+  }
+  return null;
+}
+
+function applyResolvedDisplayState() {
+  const resolved = resolveDisplayState();
+  applyState(resolved, getSvgOverride(resolved));
+}
+
+function playWakeTransitionOrResolve() {
+  if (SLEEP_MODE === "direct" && !hasOwnVisualFiles("waking")) {
+    applyResolvedDisplayState();
+    return;
+  }
+  applyState("waking");
+}
+
+function queueSleepState() {
+  if (SLEEP_MODE === "direct") {
+    setState("sleeping");
+    return;
+  }
+  setState("yawning");
+}
+
+function applyDndSleepState() {
+  if (SLEEP_MODE === "direct") {
+    applyState("sleeping");
+    return;
+  }
+  applyState(DND_SKIP_YAWN ? "collapsing" : "yawning");
+}
+
 function applyState(state, svgOverride) {
   // Phase 3b: user-disabled oneshot state — skip visual + sound, fall back to
   // whatever resolveDisplayState picks (usually working/idle). Gate lives at
@@ -203,7 +336,11 @@ function applyState(state, svgOverride) {
   if (ctx.miniMode && !state.startsWith("mini-")) {
     if (state === "notification") return applyState("mini-alert");
     if (state === "attention") return applyState("mini-happy");
-    if (AUTO_RETURN_MS[currentState] && !autoReturnTimer) {
+    if (state === "working" || state === "thinking" || state === "juggling") {
+      if (hasOwnVisualFiles("mini-working")) return applyState("mini-working");
+      return;
+    }
+    if ((AUTO_RETURN_MS[currentState] || currentState === "mini-working") && !autoReturnTimer) {
       return applyState(ctx.mouseOverPet ? "mini-peek" : "mini-idle");
     }
     return;
@@ -221,8 +358,7 @@ function applyState(state, svgOverride) {
     ctx.playSound("confirm");
   }
 
-  const svgs = STATE_SVGS[state] || STATE_SVGS.idle;
-  const svg = svgOverride || svgs[Math.floor(Math.random() * svgs.length)];
+  const svg = svgOverride || resolveVisualBinding(state);
   currentSvg = svg;
 
   // Force eye resend after SVG load completes (~300ms)
@@ -275,8 +411,7 @@ function applyState(state, svgOverride) {
   } else if (state === "waking") {
     autoReturnTimer = setTimeout(() => {
       autoReturnTimer = null;
-      const resolved = resolveDisplayState();
-      applyState(resolved, getSvgOverride(resolved));
+      applyResolvedDisplayState();
     }, WAKE_DURATION);
   } else if (AUTO_RETURN_MS[state]) {
     autoReturnTimer = setTimeout(() => {
@@ -295,8 +430,7 @@ function applyState(state, svgOverride) {
           applyState(ctx.doNotDisturb ? "mini-sleep" : "mini-idle");
         }
       } else {
-        const resolved = resolveDisplayState();
-        applyState(resolved, getSvgOverride(resolved));
+        applyResolvedDisplayState();
       }
     }, AUTO_RETURN_MS[state]);
   }
@@ -332,7 +466,7 @@ function stopWakePoll() {
 
 function wakeFromDoze() {
   if (currentState === "sleeping" || currentState === "collapsing") {
-    applyState("waking");
+    playWakeTransitionOrResolve();
     return;
   }
   ctx.sendToRenderer("wake-from-doze");
@@ -360,6 +494,64 @@ function debugSession(msg) {
   try { ctx.debugLog(msg); } catch {}
 }
 
+// Append an event to a session's rolling recentEvents list, dropping the
+// oldest when over RECENT_EVENT_LIMIT. Returned list is a new array —
+// caller assigns it to session.recentEvents.
+// Intentionally does NOT store a human-readable label field. C2 derives
+// labels via i18n at render time so language switches update existing
+// sessions' menu labels too.
+function pushRecentEvent(existing, state, event) {
+  const previous = Array.isArray(existing && existing.recentEvents)
+    ? existing.recentEvents.slice(-(RECENT_EVENT_LIMIT - 1))
+    : [];
+  previous.push({
+    at: Date.now(),
+    event: event || null,
+    state: state || "idle",
+  });
+  return previous;
+}
+
+// Derive a user-facing status badge from a session. Returns one of:
+// "running" / "done" / "interrupted" / "idle".
+// Intentionally 4 categories — not 5. There is no "exited" because sessions
+// are deleted on SessionEnd (src/state.js `sessions.delete(sessionId)`),
+// so a session with state:"sleeping"+event:"SessionEnd" is unreachable in
+// the menu iteration.
+function deriveSessionBadge(session) {
+  if (!session) return "idle";
+  // Any non-idle/non-sleeping state → session is actively doing something
+  if (session.state !== "idle" && session.state !== "sleeping") return "running";
+  // Sleeping is treated as idle (the pet sleeping doesn't mean the session is dead)
+  if (session.state === "sleeping") return "idle";
+  // state === "idle": disambiguate by most-recent event
+  const events = Array.isArray(session.recentEvents) ? session.recentEvents : [];
+  const latest = events.length ? events[events.length - 1] : null;
+  const latestEvent = latest && latest.event;
+  if (latestEvent === "StopFailure" || latestEvent === "PostToolUseFailure") return "interrupted";
+  if (latestEvent === "Stop" || latestEvent === "PostCompact") return "done";
+  return "idle";
+}
+
+// Local title normalizer (trim, strip control chars, clamp, empty → null).
+// Note: hooks/clawd-hook.js has an identical helper; hook scripts can't require src/* (different runtime
+// context: plain node child process, no Electron), so the two are kept in
+// sync manually rather than sharing a module.
+const SESSION_TITLE_CONTROL_RE = /[\u0000-\u001F\u007F-\u009F]+/g;
+const SESSION_TITLE_MAX = 80;
+
+function normalizeTitle(value) {
+  if (typeof value !== "string") return null;
+  const collapsed = value
+    .replace(SESSION_TITLE_CONTROL_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!collapsed) return null;
+  return collapsed.length > SESSION_TITLE_MAX
+    ? `${collapsed.slice(0, SESSION_TITLE_MAX - 1)}\u2026`
+    : collapsed;
+}
+
 function describeSession(sessionId, session) {
   if (!session) return `sid=${sessionId} <deleted>`;
   return [
@@ -374,7 +566,22 @@ function describeSession(sessionId, session) {
 }
 
 // ── Session management ──
-function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain, agentPid, agentId, host, headless, displayHint) {
+// Session-related fields go through `opts`. Earlier versions took 13
+// positional params — refactored in B2 to an options bag so new fields
+// (sessionTitle, etc.) don't keep extending the argument list.
+function updateSession(sessionId, state, event, opts = {}) {
+  const {
+    sourcePid = null,
+    cwd = null,
+    editor = null,
+    pidChain = null,
+    agentPid = null,
+    agentId = null,
+    host = null,
+    headless = false,
+    displayHint = undefined,
+    sessionTitle = null,
+  } = opts;
   if (startupRecoveryActive) {
     startupRecoveryActive = false;
     if (startupRecoveryTimer) { clearTimeout(startupRecoveryTimer); startupRecoveryTimer = null; }
@@ -394,6 +601,9 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
   const srcAgentId = agentId || (existing && existing.agentId) || null;
   const srcHost = host || (existing && existing.host) || null;
   const srcHeadless = headless || (existing && existing.headless) || false;
+  // Sticky: empty input does not clear an existing title. A session that has
+  // ever been named keeps that name until the user explicitly renames it.
+  const srcSessionTitle = normalizeTitle(sessionTitle) || (existing && existing.sessionTitle) || null;
   const srcResumeState = (existing && existing.resumeState) || null;
   const isSubagentStart = event === "SubagentStart" || event === "subagentStart";
   const isSubagentStop = event === "SubagentStop" || event === "subagentStop";
@@ -403,7 +613,8 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
   const pidReachable = existing ? existing.pidReachable :
     (srcAgentPid ? isProcessAlive(srcAgentPid) : (srcPid ? isProcessAlive(srcPid) : false));
 
-  const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, pidReachable };
+  const recentEvents = pushRecentEvent(existing, state, event);
+  const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, sessionTitle: srcSessionTitle, recentEvents, pidReachable };
   if (typeof ctx.notifySessionEvent === "function" && srcAgentId) {
     try {
       ctx.notifySessionEvent({
@@ -572,7 +783,7 @@ function cleanStaleSessions() {
   }
   if (changed && sessions.size === 0) {
     if (removedNonHeadless) {
-      setState("yawning");
+      queueSleepState();
     } else {
       setState("idle", SVG_IDLE_FOLLOW);
     }
@@ -761,7 +972,7 @@ function formatElapsed(ms) {
 function buildSessionSubmenu() {
   const entries = [];
   for (const [id, s] of sessions) {
-    entries.push({ id, state: s.state, updatedAt: s.updatedAt, sourcePid: s.sourcePid, cwd: s.cwd, editor: s.editor, pidChain: s.pidChain, host: s.host, headless: s.headless, agentId: s.agentId });
+    entries.push({ id, state: s.state, updatedAt: s.updatedAt, sourcePid: s.sourcePid, cwd: s.cwd, editor: s.editor, pidChain: s.pidChain, host: s.host, headless: s.headless, agentId: s.agentId, sessionTitle: s.sessionTitle, recentEvents: s.recentEvents });
   }
   if (entries.length === 0) {
     return [{ label: ctx.t("noSessions"), enabled: false }];
@@ -776,14 +987,20 @@ function buildSessionSubmenu() {
   const now = Date.now();
 
   function buildItem(e) {
-    const stateText = ctx.t(STATE_LABEL_KEY[e.state] || "sessionIdle");
+    // 4-category badge derived from session.state + recentEvents tail.
+    // Not the raw state name — user-facing language (Running/Done/...).
+    const badgeKey = SESSION_BADGE_KEYS[deriveSessionBadge(e)] || "sessionBadgeIdle";
+    const badgeText = ctx.t(badgeKey);
     const folder = e.cwd ? path.basename(e.cwd) : (e.id.length > 6 ? e.id.slice(0, 6) + ".." : e.id);
-    const name = ctx.showSessionId ? `${folder} #${e.id.slice(-3)}` : folder;
+    // Prefer user-set session title (Claude Code /rename, Codex turn summary)
+    // over the cwd folder name when available.
+    const baseName = normalizeTitle(e.sessionTitle) || folder;
+    const name = ctx.showSessionId ? `${baseName} #${e.id.slice(-3)}` : baseName;
     const elapsed = formatElapsed(now - e.updatedAt);
     const hasPid = !!e.sourcePid;
     const icon = getAgentIcon(e.agentId);
     const item = {
-      label: `${e.headless ? "🤖 " : ""}${name}  ${stateText}  ${elapsed}`,
+      label: `${e.headless ? "🤖 " : ""}${name}  ${badgeText}  ${elapsed}`,
       enabled: hasPid,
       click: hasPid ? () => ctx.focusTerminalWindow(e.sourcePid, e.cwd, e.editor, e.pidChain) : undefined,
     };
@@ -830,7 +1047,7 @@ function enableDoNotDisturb() {
   if (ctx.miniMode) {
     applyState("mini-sleep");
   } else {
-    applyState(DND_SKIP_YAWN ? "collapsing" : "yawning");
+    applyDndSleepState();
   }
   ctx.buildContextMenu();
   ctx.buildTrayMenu();
@@ -846,7 +1063,7 @@ function disableDoNotDisturb() {
     ctx.miniPeeked = false;
     applyState("mini-idle");
   } else {
-    applyState("waking");
+    playWakeTransitionOrResolve();
   }
   ctx.buildContextMenu();
   ctx.buildTrayMenu();
@@ -875,12 +1092,13 @@ function cleanup() {
 }
 
 return {
-  setState, applyState, updateSession, resolveDisplayState, setUpdateVisualState,
+  setState, applyState, updateSession, resolveDisplayState, resolveVisualBinding, setUpdateVisualState,
   enableDoNotDisturb, disableDoNotDisturb,
   startStaleCleanup, stopStaleCleanup, startWakePoll, stopWakePoll,
   getSvgOverride, cleanStaleSessions, startStartupRecovery, refreshTheme,
   detectRunningAgentProcesses, buildSessionSubmenu,
   clearSessionsByAgent,
+  deriveSessionBadge,
   getCurrentState, getCurrentSvg, getCurrentHitBox, getStartupRecoveryActive,
   sessions, STATE_PRIORITY, ONESHOT_STATES, SLEEP_SEQUENCE,
   get STATE_SVGS() { return STATE_SVGS; },
